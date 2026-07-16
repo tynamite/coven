@@ -1439,10 +1439,15 @@ fn command_parts_for_harness_with_conversation_inner(
         _ => Vec::new(),
     };
     // Sandbox/permission policy forwards to the harness's native flag ahead of
-    // the prompt positional, mirroring model selection. Harnesses that declare
-    // no sandbox mechanism yield no args (the run layer warns); `None` leaves
-    // the harness at its default (equivalent to `Full`).
-    let sandbox_args: Vec<String> = match options.permission {
+    // the prompt positional, mirroring model selection. Legacy interactive and
+    // streaming harnesses retain their native defaults when no override is
+    // supplied. Finite event-protocol adapters run headlessly, so they must
+    // receive Coven's advertised default `Full` mapping explicitly; otherwise
+    // a provider default may prompt or reject tool actions mid-turn.
+    let effective_permission = options
+        .permission
+        .or_else(|| spec.event_protocol.is_some().then_some(Permission::Full));
+    let sandbox_args: Vec<String> = match effective_permission {
         Some(p) => spec.sandbox_args(p),
         None => Vec::new(),
     };
@@ -2457,6 +2462,35 @@ mod tests {
                     "--single=fix tests".to_string(),
                 ],
             )
+        );
+
+        let default_parts = command_parts_for_harness_with_conversation(
+            "grok",
+            "default policy",
+            HarnessLaunchMode::NonInteractive,
+            Some(&conversation),
+            None,
+            HarnessLaunchOptions::default(),
+        )?;
+        assert_eq!(
+            default_parts,
+            (
+                "grok".to_string(),
+                vec![
+                    "--permission-mode".to_string(),
+                    "bypassPermissions".to_string(),
+                    "--sandbox".to_string(),
+                    "off".to_string(),
+                    "--no-auto-update".to_string(),
+                    "--no-alt-screen".to_string(),
+                    "--output-format".to_string(),
+                    "streaming-json".to_string(),
+                    "--session-id".to_string(),
+                    conversation.id().to_string(),
+                    "--single=default policy".to_string(),
+                ],
+            ),
+            "event-protocol adapters must receive Coven's default full policy explicitly"
         );
         Ok(())
     }

@@ -277,31 +277,32 @@ const PIPED_CHILD_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const PIPED_STDERR_TAIL_BYTES: usize = 8 * 1024;
 const GROK_HEADLESS_AUTH_ERROR: &str = "Grok Build requested interactive device authentication during a headless run; authenticate first with `grok login` or `grok login --device-auth`, or set XAI_API_KEY";
 
-// `codex exec --json` runs in a separate Unix session so a timeout can clean
-// up an npm/Node/Codex tree in one operation. That also means a TERM sent to
-// coven itself would otherwise leave the child group behind. The scoped guard
-// below records the cancellation in an async-signal-safe handler; the runner
-// then performs ordinary cleanup and emits its terminal result.
+// Piped one-shot harnesses run in a separate Unix session so a timeout can
+// clean up the wrapper, harness, and tool tree in one operation. That also
+// means a TERM sent to Coven itself would otherwise leave the child group
+// behind. The scoped guard below records cancellation in an async-signal-safe
+// handler; the foreground runner then performs ordinary cleanup and emits its
+// terminal result.
 #[cfg(unix)]
-static CODEX_JSON_CANCELLATION_SIGNAL: AtomicI32 = AtomicI32::new(0);
+static PIPED_CANCELLATION_SIGNAL: AtomicI32 = AtomicI32::new(0);
 #[cfg(unix)]
-static CODEX_JSON_PROCESS_GROUP: AtomicI32 = AtomicI32::new(0);
+static PIPED_PROCESS_GROUP: AtomicI32 = AtomicI32::new(0);
 #[cfg(unix)]
-static CODEX_JSON_CANCELLATION_LOCK: Mutex<()> = Mutex::new(());
+static PIPED_CANCELLATION_LOCK: Mutex<()> = Mutex::new(());
 
 #[cfg(unix)]
-extern "C" fn record_codex_json_cancellation(signal: libc::c_int) {
+extern "C" fn record_piped_cancellation(signal: libc::c_int) {
     // Atomic operations and kill(2) are async-signal-safe. The supervisor
     // turns the flag into a failed ledger/result update on its next <=50 ms
-    // poll; killing the group here prevents a detached Codex descendant from
-    // surviving if that poll is delayed.
-    let process_group = CODEX_JSON_PROCESS_GROUP.load(Ordering::Relaxed);
+    // poll; killing the group here prevents a detached harness descendant
+    // from surviving if that poll is delayed.
+    let process_group = PIPED_PROCESS_GROUP.load(Ordering::Relaxed);
     if process_group > 0 {
         unsafe {
             let _ = libc::kill(-process_group, libc::SIGKILL);
         }
     }
-    CODEX_JSON_CANCELLATION_SIGNAL.store(signal, Ordering::Relaxed);
+    PIPED_CANCELLATION_SIGNAL.store(signal, Ordering::Relaxed);
 }
 
 /// Temporarily converts TERM/INT/HUP into a supervised bridge cancellation.
@@ -311,19 +312,19 @@ extern "C" fn record_codex_json_cancellation(signal: libc::c_int) {
 /// before releasing that lock, preserving normal signal behavior for other
 /// Coven commands and unit tests.
 #[cfg(unix)]
-struct CodexCancellationGuard {
+struct PipedCancellationGuard {
     _lock: MutexGuard<'static, ()>,
     previous_handlers: Vec<(libc::c_int, libc::sigaction)>,
 }
 
 #[cfg(unix)]
-impl CodexCancellationGuard {
+impl PipedCancellationGuard {
     fn install() -> Result<Self> {
-        let lock = CODEX_JSON_CANCELLATION_LOCK
+        let lock = PIPED_CANCELLATION_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        CODEX_JSON_CANCELLATION_SIGNAL.store(0, Ordering::Relaxed);
-        CODEX_JSON_PROCESS_GROUP.store(0, Ordering::Relaxed);
+        PIPED_CANCELLATION_SIGNAL.store(0, Ordering::Relaxed);
+        PIPED_PROCESS_GROUP.store(0, Ordering::Relaxed);
 
         let mut previous_handlers = Vec::with_capacity(3);
         for signal in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
@@ -332,7 +333,7 @@ impl CodexCancellationGuard {
             // successful installation retains the prior disposition for Drop.
             unsafe {
                 let mut action: libc::sigaction = std::mem::zeroed();
-                action.sa_sigaction = record_codex_json_cancellation as *const () as usize;
+                action.sa_sigaction = record_piped_cancellation as *const () as usize;
                 libc::sigemptyset(&mut action.sa_mask);
                 action.sa_flags = 0;
                 let mut previous: libc::sigaction = std::mem::zeroed();
@@ -344,9 +345,9 @@ impl CodexCancellationGuard {
                             std::ptr::null_mut(),
                         );
                     }
-                    CODEX_JSON_CANCELLATION_SIGNAL.store(0, Ordering::Relaxed);
+                    PIPED_CANCELLATION_SIGNAL.store(0, Ordering::Relaxed);
                     return Err(std::io::Error::last_os_error()).with_context(|| {
-                        format!("failed to install Codex cancellation handler for signal {signal}")
+                        format!("failed to install piped cancellation handler for signal {signal}")
                     });
                 }
                 previous_handlers.push((signal, previous));
@@ -360,23 +361,23 @@ impl CodexCancellationGuard {
     }
 
     fn arm(&self, process_group: u32) {
-        CODEX_JSON_PROCESS_GROUP.store(process_group as i32, Ordering::Relaxed);
+        PIPED_PROCESS_GROUP.store(process_group as i32, Ordering::Relaxed);
     }
 
     fn disarm(&self) {
-        CODEX_JSON_PROCESS_GROUP.store(0, Ordering::Relaxed);
+        PIPED_PROCESS_GROUP.store(0, Ordering::Relaxed);
     }
 
     fn cancelled_signal(&self) -> Option<libc::c_int> {
-        let signal = CODEX_JSON_CANCELLATION_SIGNAL.load(Ordering::Relaxed);
+        let signal = PIPED_CANCELLATION_SIGNAL.load(Ordering::Relaxed);
         (signal != 0).then_some(signal)
     }
 }
 
 #[cfg(unix)]
-impl Drop for CodexCancellationGuard {
+impl Drop for PipedCancellationGuard {
     fn drop(&mut self) {
-        CODEX_JSON_PROCESS_GROUP.store(0, Ordering::Relaxed);
+        PIPED_PROCESS_GROUP.store(0, Ordering::Relaxed);
         // SAFETY: every entry was captured from a successful sigaction call
         // in install. Restoring it here makes the scope transparent once the
         // bridge has reaped its child tree.
@@ -385,15 +386,15 @@ impl Drop for CodexCancellationGuard {
                 let _ = libc::sigaction(*signal, previous, std::ptr::null_mut());
             }
         }
-        CODEX_JSON_CANCELLATION_SIGNAL.store(0, Ordering::Relaxed);
+        PIPED_CANCELLATION_SIGNAL.store(0, Ordering::Relaxed);
     }
 }
 
 #[cfg(not(unix))]
-struct CodexCancellationGuard;
+struct PipedCancellationGuard;
 
 #[cfg(not(unix))]
-impl CodexCancellationGuard {
+impl PipedCancellationGuard {
     fn install() -> Result<Self> {
         Ok(Self)
     }
@@ -404,7 +405,7 @@ impl CodexCancellationGuard {
 }
 
 #[cfg(unix)]
-fn codex_cancellation_error(guard: &CodexCancellationGuard) -> Option<String> {
+fn piped_cancellation_error(guard: &PipedCancellationGuard, subject: &str) -> Option<String> {
     guard.cancelled_signal().map(|signal| {
         let name = match signal {
             libc::SIGTERM => "SIGTERM",
@@ -412,12 +413,12 @@ fn codex_cancellation_error(guard: &CodexCancellationGuard) -> Option<String> {
             libc::SIGHUP => "SIGHUP",
             _ => "a termination signal",
         };
-        format!("Codex turn cancelled by {name}; the process tree was terminated")
+        format!("{subject} cancelled by {name}; the process tree was terminated")
     })
 }
 
 #[cfg(not(unix))]
-fn codex_cancellation_error(_guard: &CodexCancellationGuard) -> Option<String> {
+fn piped_cancellation_error(_guard: &PipedCancellationGuard, _subject: &str) -> Option<String> {
     None
 }
 
@@ -678,8 +679,8 @@ where
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     configure_isolated_piped_command(&mut child_command);
-    let cancellation = CodexCancellationGuard::install()?;
-    if let Some(error) = codex_cancellation_error(&cancellation) {
+    let cancellation = PipedCancellationGuard::install()?;
+    if let Some(error) = piped_cancellation_error(&cancellation, "Codex turn") {
         anyhow::bail!(error);
     }
     let mut child = child_command.spawn().with_context(|| {
@@ -777,7 +778,7 @@ where
     let mut stdin_complete = !stdin_pending;
 
     loop {
-        if let Some(error) = codex_cancellation_error(&cancellation) {
+        if let Some(error) = piped_cancellation_error(&cancellation, "Codex turn") {
             state.protocol_error.get_or_insert(error);
             process_tree.terminate(&mut child);
             status = Some(
@@ -896,7 +897,7 @@ where
     // A signal can arrive just after the final polling iteration. Honor it
     // before reporting a completed turn so cancellation always reaches the
     // ledger and terminal result when the runner still owns the child tree.
-    if let Some(error) = codex_cancellation_error(&cancellation) {
+    if let Some(error) = piped_cancellation_error(&cancellation, "Codex turn") {
         state.protocol_error.get_or_insert(error);
         process_tree.terminate(&mut child);
     }
@@ -1084,6 +1085,10 @@ where
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     configure_isolated_piped_command(&mut child_command);
+    let cancellation = PipedCancellationGuard::install()?;
+    if let Some(error) = piped_cancellation_error(&cancellation, "event-protocol harness") {
+        anyhow::bail!(error);
+    }
     let mut child = child_command.spawn().with_context(|| {
         format!(
             "failed to spawn harness `{}` with event protocol {protocol:?}",
@@ -1091,6 +1096,7 @@ where
         )
     })?;
     let mut process_tree = PipedProcessTree::attach(&child);
+    cancellation.arm(process_tree.pid);
     let child_pid = child.id();
     let stdout = match child.stdout.take() {
         Some(stdout) => stdout,
@@ -1171,6 +1177,9 @@ where
         .lock()
         .map(|tail| tail.clone())
         .unwrap_or_default();
+    if let Some(error) = piped_cancellation_error(&cancellation, "event-protocol harness") {
+        state.protocol_error.get_or_insert(error);
+    }
     if auth_wait_detected.load(std::sync::atomic::Ordering::Relaxed) {
         state.protocol_error = Some(GROK_HEADLESS_AUTH_ERROR.to_string());
     }
@@ -1188,8 +1197,14 @@ where
                 .to_string(),
         );
     }
+    // Honor a signal that arrived after the drain completed but before the
+    // terminal result was assembled, matching the Codex JSON bridge.
+    if let Some(error) = piped_cancellation_error(&cancellation, "event-protocol harness") {
+        state.protocol_error.get_or_insert(error);
+    }
 
     let failed = !status.success() || state.protocol_error.is_some();
+    cancellation.disarm();
     Ok(HarnessEventRunResult {
         process: PtyRunResult {
             status: if failed { "failed" } else { "completed" },

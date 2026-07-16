@@ -480,6 +480,160 @@ while :; do sleep 1; done
     );
 }
 
+/// Event-protocol harnesses also run in a separate Unix session. Cancelling
+/// the foreground Coven process must therefore supervise and reap that whole
+/// process group rather than leaving Grok or one of its tools detached.
+#[cfg(unix)]
+#[test]
+fn grok_event_protocol_sigint_reaps_descendants_and_marks_ledger_failed() {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::{Duration, Instant};
+
+    let temp_dir = tempfile::tempdir().expect("failed to create temp dir");
+    let coven_home = temp_dir.path().join("coven-home");
+    fs::create_dir_all(&coven_home).expect("failed to create coven home");
+    let project_root = temp_dir.path().join("project");
+    fs::create_dir_all(&project_root).expect("failed to create project root");
+    let fake_bin = temp_dir.path().join("bin");
+    fs::create_dir_all(&fake_bin).expect("failed to create fake bin dir");
+    let fake_grok = fake_bin.join("grok");
+    fs::write(
+        &fake_grok,
+        r#"#!/bin/sh
+sleep 10 </dev/null >/dev/null 2>&1 &
+echo $! > descendant.pid
+while :; do sleep 1; done
+"#,
+    )
+    .expect("failed to write fake grok");
+    let mut permissions = fs::metadata(&fake_grok)
+        .expect("failed to stat fake grok")
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&fake_grok, permissions).expect("failed to chmod fake grok");
+
+    let mut paths = vec![fake_bin];
+    if let Some(existing) = std::env::var_os("PATH") {
+        paths.extend(std::env::split_paths(&existing));
+    }
+    let path = std::env::join_paths(paths).expect("test PATH should be joinable");
+    let install = Command::new(env!("CARGO_BIN_EXE_coven"))
+        .args(["adapter", "install", "grok"])
+        .env("COVEN_HOME", &coven_home)
+        .env("PATH", &path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("failed to install Grok adapter fixture");
+    assert!(
+        install.status.success(),
+        "Grok adapter install failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&install.stdout),
+        String::from_utf8_lossy(&install.stderr),
+    );
+
+    let mut coven = Command::new(env!("CARGO_BIN_EXE_coven"))
+        .args([
+            "run",
+            "grok",
+            "--stream-json",
+            "--",
+            "wait for cancellation",
+        ])
+        .current_dir(&project_root)
+        .env("COVEN_HOME", &coven_home)
+        .env("PATH", &path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn coven binary");
+
+    let descendant_path = project_root.join("descendant.pid");
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !descendant_path.exists() && Instant::now() < deadline {
+        if let Some(status) = coven.try_wait().expect("failed polling coven") {
+            panic!("coven exited before Grok fixture was ready: {status}");
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert!(
+        descendant_path.exists(),
+        "Grok fixture did not start before cancellation"
+    );
+    let signal_result = unsafe { libc::kill(coven.id() as libc::pid_t, libc::SIGINT) };
+    assert_eq!(
+        signal_result,
+        0,
+        "failed to signal the Coven process: {}",
+        std::io::Error::last_os_error()
+    );
+    let out = coven
+        .wait_with_output()
+        .expect("failed waiting for cancelled coven");
+
+    assert!(
+        !out.status.success(),
+        "cancellation must return non-zero: stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let stdout = String::from_utf8(out.stdout).expect("stdout not utf-8");
+    let frames: Vec<serde_json::Value> = stdout
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).expect("Coven stdout must remain JSONL"))
+        .collect();
+    let result = frames.last().expect("result frame should be last");
+    assert_eq!(result["type"], "result");
+    assert_eq!(result["is_error"], true);
+    assert!(
+        result["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("cancelled by SIGINT")),
+        "cancellation detail should reach the client protocol: {result}"
+    );
+
+    let session_id = frames[0]["session_id"]
+        .as_str()
+        .expect("system frame carries stable Coven id");
+    let conn = rusqlite::Connection::open(coven_home.join("coven.sqlite3"))
+        .expect("failed to open Coven session ledger");
+    let (status, exit_code): (String, Option<i32>) = conn
+        .query_row(
+            "SELECT status, exit_code FROM sessions WHERE id = ?1",
+            [session_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("cancelled session should remain in the ledger");
+    assert_eq!(status, "failed");
+    assert_eq!(exit_code, Some(1));
+
+    let descendant_pid = fs::read_to_string(&descendant_path)
+        .expect("failed to read descendant pid")
+        .trim()
+        .to_string();
+    let mut alive = true;
+    for _ in 0..80 {
+        alive = Command::new("kill")
+            .args(["-0", &descendant_pid])
+            .stderr(Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+        if !alive {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert!(
+        !alive,
+        "cancelled Grok descendant {descendant_pid} should be reaped"
+    );
+}
+
 /// End-to-end Windows regression: an npm-style `codex.cmd` must receive a
 /// multiline prompt through stdin (not ConPTY/cmd argv), and the Coven CLI
 /// must surface the Codex JSON response as an `assistant` frame. The second

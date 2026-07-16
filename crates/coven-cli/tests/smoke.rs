@@ -972,6 +972,9 @@ fn grok_adapter_translates_headless_events_and_resumes_the_assigned_session() ->
     assert!(launches
         .iter()
         .all(|launch| launch.contains("--output-format\nstreaming-json\n")));
+    assert!(launches.iter().all(|launch| {
+        launch.contains("--permission-mode\nbypassPermissions\n--sandbox\noff\n")
+    }), "ordinary and resumed Grok launches must receive Coven's default full permission mapping: {invocations}");
     Ok(())
 }
 
@@ -981,6 +984,7 @@ fn grok_adapter_translates_events_through_the_daemon() -> anyhow::Result<()> {
     let coven_home = temp_dir.path().join("coven-home");
     let fake_bin = temp_dir.path().join("bin");
     let project_root = temp_dir.path().join("project");
+    let arg_log = temp_dir.path().join("grok-daemon-args.log");
     fs::create_dir_all(&fake_bin)?;
     fs::create_dir_all(&project_root)?;
     write_fake_grok(&fake_bin)?;
@@ -993,7 +997,15 @@ fn grok_adapter_translates_events_through_the_daemon() -> anyhow::Result<()> {
         coven_home: coven_home.clone(),
         path: path.clone(),
     };
-    let start = run_coven(&coven, &coven_home, &path, &["daemon", "start"])?;
+    let arg_log_value = arg_log.to_string_lossy().into_owned();
+    let start = run_coven_in(
+        &coven,
+        &coven_home,
+        &path,
+        &project_root,
+        &[("FAKE_GROK_ARG_LOG", arg_log_value.as_str())],
+        &["daemon", "start"],
+    )?;
     assert_success("daemon start for Grok", &start);
     wait_for_daemon_health(&coven_home)?;
 
@@ -1036,6 +1048,20 @@ fn grok_adapter_translates_events_through_the_daemon() -> anyhow::Result<()> {
     )?;
     assert!(!resumed_events.contains("private reasoning"));
     assert!(!resumed_events.contains(r#"\"type\":\"end\""#));
+
+    let invocations = fs::read_to_string(&arg_log)?;
+    let launches = invocations.split("BEGIN\n").skip(1).collect::<Vec<_>>();
+    assert_eq!(
+        launches.len(),
+        2,
+        "expected one daemon Grok process per turn"
+    );
+    assert!(
+        launches.iter().all(|launch| {
+            launch.contains("--permission-mode\nbypassPermissions\n--sandbox\noff\n")
+        }),
+        "daemon Grok launches must receive Coven's default full permission mapping: {invocations}"
+    );
     Ok(())
 }
 
