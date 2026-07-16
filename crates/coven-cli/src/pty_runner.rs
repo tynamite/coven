@@ -41,6 +41,34 @@ pub struct CodexJsonRunResult {
     pub emitted_assistant: bool,
 }
 
+/// Outcome of a one-shot adapter whose stdout follows a declared native event
+/// protocol (currently Grok Build's public headless JSONL schema).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HarnessEventRunResult {
+    pub process: PtyRunResult,
+    pub harness_session_id: Option<String>,
+    pub request_id: Option<String>,
+    pub stop_reason: Option<String>,
+    pub error: Option<String>,
+    pub emitted_assistant: bool,
+}
+
+#[derive(Default)]
+struct HarnessEventState {
+    harness_session_id: Option<String>,
+    request_id: Option<String>,
+    stop_reason: Option<String>,
+    protocol_error: Option<String>,
+    emitted_assistant: bool,
+    saw_end: bool,
+}
+
+enum HarnessEventStdoutMessage {
+    Line(String),
+    ReadError(String),
+    Closed,
+}
+
 pub struct DetachedPtySession {
     pub input: Box<dyn Write + Send>,
     pub killer: Box<dyn ChildKiller + Send + Sync>,
@@ -247,6 +275,7 @@ const CODEX_JSON_ACTIVITY_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const CODEX_POST_EXIT_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 const CODEX_CHILD_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const CODEX_STDERR_TAIL_BYTES: usize = 8 * 1024;
+const GROK_HEADLESS_AUTH_ERROR: &str = "Grok Build requested interactive device authentication during a headless run; authenticate first with `grok login` or `grok login --device-auth`, or set XAI_API_KEY";
 
 // `codex exec --json` runs in a separate Unix session so a timeout can clean
 // up an npm/Node/Codex tree in one operation. That also means a TERM sent to
@@ -427,21 +456,21 @@ struct CodexJsonState {
     emitted_assistant: bool,
 }
 
-/// Owns the direct Codex child and all of its descendants while a one-shot
-/// JSON turn is running. A Node/npm wrapper can outlive or outspawn the direct
+/// Owns a direct one-shot harness child and all of its descendants while a
+/// JSON turn is running. A wrapper or tool subprocess can outlive the direct
 /// launcher, so a plain `Child::kill()` is not enough to guarantee pipe EOF.
-struct CodexProcessTree {
+struct PipedProcessTree {
     pid: u32,
     terminated: bool,
     #[cfg(windows)]
     job_handle: Option<windows_sys::Win32::Foundation::HANDLE>,
 }
 
-impl CodexProcessTree {
+impl PipedProcessTree {
     fn attach(child: &std::process::Child) -> Self {
         let pid = child.id();
         #[cfg(windows)]
-        let job_handle = codex_job_object_for_process(child);
+        let job_handle = piped_job_object_for_process(child);
         Self {
             pid,
             terminated: false,
@@ -457,7 +486,7 @@ impl CodexProcessTree {
         self.terminated = true;
         #[cfg(unix)]
         {
-            terminate_codex_unix_process_group(self.pid);
+            terminate_piped_unix_process_group(self.pid);
         }
         #[cfg(windows)]
         {
@@ -475,7 +504,7 @@ impl CodexProcessTree {
             if !terminated_by_job {
                 // A Job Object can be unavailable when a parent policy forbids
                 // assignment. Fall back to Windows' documented tree kill for
-                // npm's cmd.exe -> node.exe -> codex.exe chain.
+                // wrapper -> runtime -> harness/tool chains.
                 let pid = self.pid.to_string();
                 let _ = std::process::Command::new("taskkill")
                     .args(["/PID", &pid, "/T", "/F"])
@@ -490,37 +519,37 @@ impl CodexProcessTree {
 }
 
 #[cfg(unix)]
-fn terminate_codex_unix_process_group(pid: u32) {
+fn terminate_piped_unix_process_group(pid: u32) {
     // The launch config puts the child at the head of a new session, so the
     // negative pid reaches its wrapper and every descendant.
     let _ = unsafe { libc::kill(-(pid as libc::pid_t), libc::SIGKILL) };
 }
 
 #[cfg(unix)]
-impl Drop for CodexProcessTree {
+impl Drop for PipedProcessTree {
     fn drop(&mut self) {
         if !self.terminated {
             // A wrapper can exit after detaching a descendant that has already
             // closed stdout/stderr. There is then no pipe timeout to trigger
             // terminate(), but this one-shot runner still owns that group.
-            terminate_codex_unix_process_group(self.pid);
+            terminate_piped_unix_process_group(self.pid);
         }
     }
 }
 
 #[cfg(windows)]
-impl Drop for CodexProcessTree {
+impl Drop for PipedProcessTree {
     fn drop(&mut self) {
         if let Some(job) = self.job_handle.take() {
             // The job is configured with KILL_ON_JOB_CLOSE, so an abrupt
-            // coven.exe exit also cleans up npm/Node/Codex descendants.
+            // coven.exe exit also cleans up harness descendants.
             unsafe { windows_sys::Win32::Foundation::CloseHandle(job) };
         }
     }
 }
 
 #[cfg(windows)]
-fn codex_job_object_for_process(
+fn piped_job_object_for_process(
     child: &std::process::Child,
 ) -> Option<windows_sys::Win32::Foundation::HANDLE> {
     use std::mem::size_of;
@@ -559,14 +588,14 @@ fn codex_job_object_for_process(
     }
 }
 
-fn configure_codex_json_command(_command: &mut std::process::Command) {
+fn configure_isolated_piped_command(_command: &mut std::process::Command) {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
         unsafe {
             _command.pre_exec(|| {
                 // Isolate this turn in a fresh process group. A timeout can
-                // then kill the npm/Node/native Codex tree in one signal.
+                // then kill the wrapper, harness, and tool tree in one signal.
                 if libc::setsid() == -1 {
                     return Err(std::io::Error::last_os_error());
                 }
@@ -648,7 +677,7 @@ where
         })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    configure_codex_json_command(&mut child_command);
+    configure_isolated_piped_command(&mut child_command);
     let cancellation = CodexCancellationGuard::install()?;
     if let Some(error) = codex_cancellation_error(&cancellation) {
         anyhow::bail!(error);
@@ -659,7 +688,7 @@ where
             command.program()
         )
     })?;
-    let mut process_tree = CodexProcessTree::attach(&child);
+    let mut process_tree = PipedProcessTree::attach(&child);
     cancellation.arm(process_tree.pid);
 
     let stdout = match child.stdout.take() {
@@ -1012,6 +1041,404 @@ fn codex_event_error_message(event: &serde_json::Value) -> Option<String> {
         .and_then(serde_json::Value::as_str)
         .filter(|message| !message.trim().is_empty())
         .map(ToOwned::to_owned)
+}
+
+/// Run a one-shot harness through its declared native JSONL event protocol.
+///
+/// Grok Build's headless mode is a normal finite process, not the long-lived
+/// bidirectional stream used by Claude. Ordinary pipes keep its JSON frames
+/// free of PTY escape sequences; only native `text` payloads reach the caller.
+pub fn stream_harness_event_protocol<F>(
+    command: &HarnessCommand,
+    protocol: crate::harness::HarnessEventProtocol,
+    expected_session_id: Option<&str>,
+    mut on_assistant: F,
+) -> Result<HarnessEventRunResult>
+where
+    F: FnMut(&str) -> Result<()>,
+{
+    let mut child_command = std::process::Command::new(&command.program);
+    child_command
+        .args(&command.args)
+        .current_dir(&command.cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    configure_isolated_piped_command(&mut child_command);
+    let mut child = child_command.spawn().with_context(|| {
+        format!(
+            "failed to spawn harness `{}` with event protocol {protocol:?}",
+            command.program()
+        )
+    })?;
+    let mut process_tree = PipedProcessTree::attach(&child);
+    let child_pid = child.id();
+    let stdout = match child.stdout.take() {
+        Some(stdout) => stdout,
+        None => {
+            process_tree.terminate(&mut child);
+            let _ = child.wait();
+            anyhow::bail!("event-protocol harness did not expose stdout");
+        }
+    };
+    let stderr = match child.stderr.take() {
+        Some(stderr) => stderr,
+        None => {
+            process_tree.terminate(&mut child);
+            let _ = child.wait();
+            anyhow::bail!("event-protocol harness did not expose stderr");
+        }
+    };
+
+    // Preserve native diagnostics on stderr while retaining a bounded tail for
+    // a useful terminal error if the process exits non-zero without an `error`
+    // frame. Keeping diagnostics off stdout preserves Coven's JSONL contract.
+    let stderr_tail = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let auth_wait_detected = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stderr_tail_writer = std::sync::Arc::clone(&stderr_tail);
+    let stderr_auth_wait = std::sync::Arc::clone(&auth_wait_detected);
+    let (stderr_done_tx, stderr_done_rx) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        let mut reader = BufReader::new(stderr);
+        let mut buffer = Vec::with_capacity(256);
+        loop {
+            buffer.clear();
+            match reader.read_until(b'\n', &mut buffer) {
+                Ok(0) => break,
+                Ok(_) => {
+                    if stderr_auth_wait.load(std::sync::atomic::Ordering::Relaxed) {
+                        continue;
+                    }
+                    let line = String::from_utf8_lossy(&buffer);
+                    if harness_event_requests_interactive_auth(protocol, &line) {
+                        stderr_auth_wait.store(true, std::sync::atomic::Ordering::Relaxed);
+                        terminate_isolated_process_by_pid(child_pid);
+                        continue;
+                    }
+                    {
+                        let mut sink = io::stderr().lock();
+                        let _ = sink.write_all(&buffer);
+                        let _ = sink.flush();
+                    }
+                    if let Ok(mut tail) = stderr_tail_writer.lock() {
+                        append_bounded_tail(&mut tail, &buffer, CODEX_STDERR_TAIL_BYTES);
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        let _ = stderr_done_tx.send(());
+    });
+
+    let mut state = HarnessEventState::default();
+    let (status, pipe_timeout) = match drain_harness_event_stdout(
+        stdout,
+        &mut child,
+        &mut process_tree,
+        protocol,
+        &mut state,
+        &mut on_assistant,
+    ) {
+        Ok(result) => result,
+        Err(error) => {
+            let _ = child.wait();
+            let _ = stderr_done_rx.recv_timeout(CODEX_POST_EXIT_DRAIN_TIMEOUT);
+            return Err(error);
+        }
+    };
+    let _ = stderr_done_rx.recv_timeout(CODEX_POST_EXIT_DRAIN_TIMEOUT);
+    let stderr_tail = stderr_tail
+        .lock()
+        .map(|tail| tail.clone())
+        .unwrap_or_default();
+    if auth_wait_detected.load(std::sync::atomic::Ordering::Relaxed) {
+        state.protocol_error = Some(GROK_HEADLESS_AUTH_ERROR.to_string());
+    }
+    finalize_harness_event_process_state(
+        &mut state,
+        protocol,
+        expected_session_id,
+        status.success(),
+        status.code(),
+        &stderr_tail,
+    );
+    if pipe_timeout && state.protocol_error.is_none() {
+        state.protocol_error = Some(
+            "harness exited but its output pipe remained open; terminated remaining process tree"
+                .to_string(),
+        );
+    }
+
+    let failed = !status.success() || state.protocol_error.is_some();
+    Ok(HarnessEventRunResult {
+        process: PtyRunResult {
+            status: if failed { "failed" } else { "completed" },
+            exit_code: if failed {
+                status.code().filter(|code| *code != 0).or(Some(1))
+            } else {
+                status.code()
+            },
+        },
+        harness_session_id: state.harness_session_id,
+        request_id: state.request_id,
+        stop_reason: state.stop_reason,
+        error: state.protocol_error,
+        emitted_assistant: state.emitted_assistant,
+    })
+}
+
+fn harness_event_requests_interactive_auth(
+    protocol: crate::harness::HarnessEventProtocol,
+    stderr_line: &str,
+) -> bool {
+    matches!(
+        protocol,
+        crate::harness::HarnessEventProtocol::GrokHeadlessV1
+    ) && stderr_line.contains("To sign in, open this URL in your browser:")
+}
+
+fn terminate_isolated_process_by_pid(pid: u32) {
+    #[cfg(unix)]
+    unsafe {
+        let _ = libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
+        let _ = libc::kill(pid as libc::pid_t, libc::SIGKILL);
+    }
+    #[cfg(windows)]
+    unsafe {
+        use windows_sys::Win32::{
+            Foundation::{CloseHandle, INVALID_HANDLE_VALUE},
+            System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE},
+        };
+        let handle = OpenProcess(PROCESS_TERMINATE, 0, pid);
+        if handle != 0 as _ && handle != INVALID_HANDLE_VALUE {
+            let _ = TerminateProcess(handle, 1);
+            CloseHandle(handle);
+        }
+    }
+}
+
+fn handle_harness_event_line<F>(
+    protocol: crate::harness::HarnessEventProtocol,
+    line: &str,
+    state: &mut HarnessEventState,
+    on_assistant: &mut F,
+) -> Result<()>
+where
+    F: FnMut(&str) -> Result<()>,
+{
+    let event: serde_json::Value = serde_json::from_str(line)
+        .with_context(|| format!("harness emitted malformed {protocol:?} JSONL"))?;
+    let kind = event
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .context("harness event is missing string field `type`")?;
+
+    match protocol {
+        crate::harness::HarnessEventProtocol::GrokHeadlessV1 => match kind {
+            "text" => {
+                let text = event
+                    .get("data")
+                    .and_then(serde_json::Value::as_str)
+                    .context("Grok Build `text` event is missing string field `data`")?;
+                if !text.is_empty() {
+                    on_assistant(text)?;
+                    state.emitted_assistant = true;
+                }
+            }
+            "thought" => {
+                // Deliberately validate but do not forward model reasoning.
+                event
+                    .get("data")
+                    .and_then(serde_json::Value::as_str)
+                    .context("Grok Build `thought` event is missing string field `data`")?;
+            }
+            "end" => {
+                if state.saw_end {
+                    anyhow::bail!("Grok Build emitted more than one terminal `end` event");
+                }
+                let stop_reason = event
+                    .get("stopReason")
+                    .and_then(serde_json::Value::as_str)
+                    .context("Grok Build `end` event is missing string field `stopReason`")?;
+                let session_id = event
+                    .get("sessionId")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|id| !id.trim().is_empty())
+                    .context(
+                        "Grok Build `end` event is missing non-empty string field `sessionId`",
+                    )?;
+                let request_id = event
+                    .get("requestId")
+                    .and_then(serde_json::Value::as_str)
+                    .context("Grok Build `end` event is missing string field `requestId`")?;
+                state.saw_end = true;
+                state.stop_reason = Some(stop_reason.to_string());
+                state.harness_session_id = Some(session_id.to_string());
+                state.request_id = Some(request_id.to_string());
+            }
+            "error" => {
+                let message = event
+                    .get("message")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|message| !message.trim().is_empty())
+                    .context(
+                        "Grok Build `error` event is missing non-empty string field `message`",
+                    )?;
+                state.protocol_error.get_or_insert(message.to_string());
+            }
+            // The upstream enum is intentionally non-exhaustive. Events such
+            // as `max_turns_reached` may appear before the terminal `end`.
+            _ => {}
+        },
+    }
+    Ok(())
+}
+
+fn finalize_harness_event_state(
+    state: &mut HarnessEventState,
+    protocol: crate::harness::HarnessEventProtocol,
+    expected_session_id: Option<&str>,
+) {
+    if !state.saw_end && state.protocol_error.is_none() {
+        state.protocol_error = Some(format!(
+            "harness completed without the terminal `end` event required by {protocol:?}"
+        ));
+        return;
+    }
+    if let (Some(expected), Some(actual)) =
+        (expected_session_id, state.harness_session_id.as_deref())
+    {
+        if expected != actual {
+            state.protocol_error = Some(format!(
+                "harness returned session id `{actual}` after Coven assigned `{expected}`"
+            ));
+        }
+    }
+}
+
+fn finalize_harness_event_process_state(
+    state: &mut HarnessEventState,
+    protocol: crate::harness::HarnessEventProtocol,
+    expected_session_id: Option<&str>,
+    process_succeeded: bool,
+    exit_code: Option<i32>,
+    stderr_tail: &[u8],
+) {
+    let missing_terminal_event = !state.saw_end && state.protocol_error.is_none();
+    finalize_harness_event_state(state, protocol, expected_session_id);
+    if process_succeeded {
+        return;
+    }
+
+    let code = exit_code
+        .map(|code| code.to_string())
+        .unwrap_or_else(|| "an unknown status".to_string());
+    let stderr = String::from_utf8_lossy(stderr_tail).trim().to_string();
+    if missing_terminal_event && !stderr.is_empty() {
+        state.protocol_error = Some(format!(
+            "harness exited with {code} before emitting the terminal `end` event required by {protocol:?}: {stderr}"
+        ));
+    } else if state.protocol_error.is_none() {
+        state.protocol_error = Some(if stderr.is_empty() {
+            format!("harness exited with {code}")
+        } else {
+            format!("harness exited with {code}: {stderr}")
+        });
+    }
+}
+
+fn drain_harness_event_stdout<F>(
+    stdout: std::process::ChildStdout,
+    child: &mut std::process::Child,
+    process_tree: &mut PipedProcessTree,
+    protocol: crate::harness::HarnessEventProtocol,
+    state: &mut HarnessEventState,
+    on_assistant: &mut F,
+) -> Result<(std::process::ExitStatus, bool)>
+where
+    F: FnMut(&str) -> Result<()>,
+{
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            let message = match line {
+                Ok(line) => HarnessEventStdoutMessage::Line(line),
+                Err(error) => HarnessEventStdoutMessage::ReadError(error.to_string()),
+            };
+            if sender.send(message).is_err() {
+                return;
+            }
+        }
+        let _ = sender.send(HarnessEventStdoutMessage::Closed);
+    });
+
+    let mut status = None;
+    let mut post_exit_deadline = None;
+    let mut stdout_closed = false;
+    let mut pipe_timeout = false;
+    loop {
+        if status.is_none() {
+            status = match child.try_wait() {
+                Ok(status) => status,
+                Err(error) => {
+                    process_tree.terminate(child);
+                    return Err(error).context("failed polling event-protocol harness");
+                }
+            };
+            if status.is_some() {
+                post_exit_deadline = Some(Instant::now() + CODEX_POST_EXIT_DRAIN_TIMEOUT);
+            }
+        }
+        if status.is_some() && stdout_closed {
+            break;
+        }
+
+        let wait = if let Some(deadline) = post_exit_deadline {
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .unwrap_or_default();
+            if remaining.is_zero() {
+                pipe_timeout = true;
+                process_tree.terminate(child);
+                break;
+            }
+            remaining.min(CODEX_CHILD_POLL_INTERVAL)
+        } else {
+            CODEX_CHILD_POLL_INTERVAL
+        };
+
+        if stdout_closed {
+            thread::sleep(wait);
+            continue;
+        }
+        match receiver.recv_timeout(wait) {
+            Ok(HarnessEventStdoutMessage::Line(line)) => {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                if let Err(error) = handle_harness_event_line(protocol, &line, state, on_assistant)
+                {
+                    process_tree.terminate(child);
+                    return Err(error);
+                }
+            }
+            Ok(HarnessEventStdoutMessage::ReadError(error)) => {
+                process_tree.terminate(child);
+                anyhow::bail!("failed reading harness event output: {error}");
+            }
+            Ok(HarnessEventStdoutMessage::Closed) => stdout_closed = true,
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => stdout_closed = true,
+        }
+    }
+
+    let status = match status {
+        Some(status) => status,
+        None => child
+            .wait()
+            .context("failed waiting for event-protocol harness")?,
+    };
+    Ok((status, pipe_timeout))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1422,6 +1849,32 @@ pub fn spawn_piped_with_observer(
     observer: Option<DetachedPtyObserver>,
     wrap_stderr_as_stream_json: bool,
 ) -> Result<PipedSession> {
+    spawn_piped_with_observer_inner(command, observer, wrap_stderr_as_stream_json, None)
+}
+
+/// Spawn a finite headless harness and translate its native JSONL into plain
+/// assistant output before it reaches the daemon event log. The returned input
+/// is a sink because each later chat turn must cold-start with `--resume`.
+pub fn spawn_harness_event_protocol_with_observer(
+    command: &HarnessCommand,
+    observer: Option<DetachedPtyObserver>,
+    protocol: crate::harness::HarnessEventProtocol,
+    expected_session_id: Option<&str>,
+) -> Result<PipedSession> {
+    spawn_piped_with_observer_inner(
+        command,
+        observer,
+        false,
+        Some((protocol, expected_session_id.map(str::to_string))),
+    )
+}
+
+fn spawn_piped_with_observer_inner(
+    command: &HarnessCommand,
+    observer: Option<DetachedPtyObserver>,
+    wrap_stderr_as_stream_json: bool,
+    event_bridge: Option<(crate::harness::HarnessEventProtocol, Option<String>)>,
+) -> Result<PipedSession> {
     use std::process::Command as StdCommand;
     use std::sync::{Arc, Mutex as StdMutex};
 
@@ -1459,13 +1912,19 @@ pub fn spawn_piped_with_observer(
             command.program
         )
     })?;
+    let event_process_tree = event_bridge
+        .as_ref()
+        .map(|_| PipedProcessTree::attach(&child));
 
     let pid = child.id();
     let mut stdin = child
         .stdin
         .take()
         .context("failed to take child stdin in piped mode")?;
-    let stdin: Box<dyn Write + Send> = if let Some(prompt) = command.stdin_prompt.as_deref() {
+    let stdin: Box<dyn Write + Send> = if event_bridge.is_some() {
+        drop(stdin);
+        Box::new(io::sink())
+    } else if let Some(prompt) = command.stdin_prompt.as_deref() {
         if let Err(error) = stdin.write_all(prompt).and_then(|_| stdin.flush()) {
             let _ = child.kill();
             let _ = child.wait();
@@ -1494,6 +1953,9 @@ pub fn spawn_piped_with_observer(
         on_exit: Box::new(|_| {}),
     });
     let on_output_shared = Arc::new(StdMutex::new(on_output));
+    let stderr_event_protocol = event_bridge.as_ref().map(|(protocol, _)| *protocol);
+    let auth_wait_detected = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stderr_tail = Arc::new(StdMutex::new(Vec::new()));
 
     // Stderr drain: line-buffered, wrapped in a stream-json system
     // envelope so chat can render auth/setup messages as system lines
@@ -1503,6 +1965,9 @@ pub fn spawn_piped_with_observer(
     // the stream at the first decode error — which `BufRead::lines()`
     // would do.
     let stderr_callback = Arc::clone(&on_output_shared);
+    let stderr_auth_wait = Arc::clone(&auth_wait_detected);
+    let stderr_tail_writer = Arc::clone(&stderr_tail);
+    let (stderr_done_tx, stderr_done_rx) = std::sync::mpsc::channel();
     thread::spawn(move || {
         let mut reader = BufReader::new(stderr);
         let mut buf: Vec<u8> = Vec::with_capacity(256);
@@ -1511,6 +1976,9 @@ pub fn spawn_piped_with_observer(
             match reader.read_until(b'\n', &mut buf) {
                 Ok(0) => break, // EOF
                 Ok(_) => {
+                    if stderr_auth_wait.load(std::sync::atomic::Ordering::Relaxed) {
+                        continue;
+                    }
                     // Strip the trailing newline (if any) for cleaner
                     // display; the JSON envelope adds its own.
                     let trimmed = match buf.last() {
@@ -1518,6 +1986,18 @@ pub fn spawn_piped_with_observer(
                         _ => &buf[..],
                     };
                     let line = String::from_utf8_lossy(trimmed);
+                    if stderr_event_protocol.is_some_and(|protocol| {
+                        harness_event_requests_interactive_auth(protocol, &line)
+                    }) {
+                        stderr_auth_wait.store(true, std::sync::atomic::Ordering::Relaxed);
+                        terminate_isolated_process_by_pid(pid);
+                        continue;
+                    }
+                    if stderr_event_protocol.is_some() {
+                        if let Ok(mut tail) = stderr_tail_writer.lock() {
+                            append_bounded_tail(&mut tail, &buf, CODEX_STDERR_TAIL_BYTES);
+                        }
+                    }
                     let mut payload = if wrap_stderr_as_stream_json {
                         serde_json::json!({
                             "type": "system",
@@ -1536,33 +2016,115 @@ pub fn spawn_piped_with_observer(
                 Err(_) => break,
             }
         }
+        let _ = stderr_done_tx.send(());
     });
 
     // Stdout drain + wait. The wait thread OWNS `child`; the killer never
     // touches the `Child` handle, only the PID. That removes the previous
     // deadlock risk where `wait()` and `kill()` raced on a shared mutex.
     let stdout_callback = Arc::clone(&on_output_shared);
+    let stdout_auth_wait = Arc::clone(&auth_wait_detected);
+    let stdout_stderr_tail = Arc::clone(&stderr_tail);
     thread::spawn(move || {
-        let mut reader = stdout;
-        let mut bridge: Box<dyn FnMut(Vec<u8>) + Send + 'static> = Box::new(move |chunk| {
-            if let Ok(mut cb) = stdout_callback.lock() {
-                cb(chunk);
+        let result = if let Some((protocol, expected_session_id)) = event_bridge {
+            let mut process_tree = event_process_tree
+                .expect("event-protocol launch should own an isolated process tree");
+            let mut state = HarnessEventState::default();
+            let mut on_assistant = |text: &str| -> Result<()> {
+                if let Ok(mut cb) = stdout_callback.lock() {
+                    cb(text.as_bytes().to_vec());
+                }
+                Ok(())
+            };
+            let (status, pipe_timeout) = match drain_harness_event_stdout(
+                stdout,
+                &mut child,
+                &mut process_tree,
+                protocol,
+                &mut state,
+                &mut on_assistant,
+            ) {
+                Ok((status, pipe_timeout)) => (Ok(status), pipe_timeout),
+                Err(error) => {
+                    state
+                        .protocol_error
+                        .get_or_insert_with(|| format!("{error:#}"));
+                    process_tree.terminate(&mut child);
+                    (child.wait(), false)
+                }
+            };
+            let _ = stderr_done_rx.recv_timeout(CODEX_POST_EXIT_DRAIN_TIMEOUT);
+            if stdout_auth_wait.load(std::sync::atomic::Ordering::Relaxed) {
+                state.protocol_error = Some(GROK_HEADLESS_AUTH_ERROR.to_string());
             }
-        });
-        drain_detached_output(&mut reader, Some(&mut bridge));
-        let result = match child.wait() {
-            Ok(status) => PtyRunResult {
-                status: if status.success() {
-                    "completed"
-                } else {
-                    "failed"
+            let process_succeeded = status
+                .as_ref()
+                .map(|status| status.success())
+                .unwrap_or(false);
+            let exit_code = status.as_ref().ok().and_then(|status| status.code());
+            let stderr_tail = stdout_stderr_tail
+                .lock()
+                .map(|tail| tail.clone())
+                .unwrap_or_default();
+            finalize_harness_event_process_state(
+                &mut state,
+                protocol,
+                expected_session_id.as_deref(),
+                process_succeeded,
+                exit_code,
+                &stderr_tail,
+            );
+            if pipe_timeout && state.protocol_error.is_none() {
+                state.protocol_error = Some(
+                    "harness exited but its output pipe remained open; terminated remaining process tree"
+                        .to_string(),
+                );
+            }
+            if let Some(error) = state.protocol_error.as_deref() {
+                if let Ok(mut cb) = stdout_callback.lock() {
+                    cb(format!("{error}\n").into_bytes());
+                }
+            }
+            match status {
+                Ok(status) => {
+                    let failed = !status.success() || state.protocol_error.is_some();
+                    PtyRunResult {
+                        status: if failed { "failed" } else { "completed" },
+                        exit_code: if failed {
+                            status.code().filter(|code| *code != 0).or(Some(1))
+                        } else {
+                            status.code()
+                        },
+                    }
+                }
+                Err(_) => PtyRunResult {
+                    status: "failed",
+                    exit_code: None,
                 },
-                exit_code: status.code(),
-            },
-            Err(_) => PtyRunResult {
-                status: "failed",
-                exit_code: None,
-            },
+            }
+        } else {
+            let mut reader = stdout;
+            let mut bridge: Box<dyn FnMut(Vec<u8>) + Send + 'static> = Box::new(move |chunk| {
+                if let Ok(mut cb) = stdout_callback.lock() {
+                    cb(chunk);
+                }
+            });
+            drain_detached_output(&mut reader, Some(&mut bridge));
+            let status = child.wait();
+            match status {
+                Ok(status) => PtyRunResult {
+                    status: if status.success() {
+                        "completed"
+                    } else {
+                        "failed"
+                    },
+                    exit_code: status.code(),
+                },
+                Err(_) => PtyRunResult {
+                    status: "failed",
+                    exit_code: None,
+                },
+            }
         };
         on_exit(result);
     });
@@ -1840,6 +2402,421 @@ mod tests {
         FAKE_CLAUDE_SPAWN_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    #[test]
+    fn grok_headless_parser_translates_public_schema_without_exposing_thoughts(
+    ) -> anyhow::Result<()> {
+        let protocol = crate::harness::HarnessEventProtocol::GrokHeadlessV1;
+        let mut state = HarnessEventState::default();
+        let mut output = String::new();
+        let mut on_assistant = |text: &str| -> Result<()> {
+            output.push_str(text);
+            Ok(())
+        };
+
+        handle_harness_event_line(
+            protocol,
+            r#"{"type":"thought","data":"private reasoning"}"#,
+            &mut state,
+            &mut on_assistant,
+        )?;
+        handle_harness_event_line(
+            protocol,
+            r#"{"type":"text","data":"hello "}"#,
+            &mut state,
+            &mut on_assistant,
+        )?;
+        handle_harness_event_line(
+            protocol,
+            r#"{"type":"max_turns_reached"}"#,
+            &mut state,
+            &mut on_assistant,
+        )?;
+        handle_harness_event_line(
+            protocol,
+            r#"{"type":"text","data":"world"}"#,
+            &mut state,
+            &mut on_assistant,
+        )?;
+        handle_harness_event_line(
+            protocol,
+            r#"{"type":"end","stopReason":"EndTurn","sessionId":"session-1","requestId":""}"#,
+            &mut state,
+            &mut on_assistant,
+        )?;
+        finalize_harness_event_state(&mut state, protocol, Some("session-1"));
+
+        assert_eq!(output, "hello world");
+        assert!(!output.contains("private reasoning"));
+        assert_eq!(state.harness_session_id.as_deref(), Some("session-1"));
+        // Upstream currently defaults a missing ACP request id to an empty
+        // string in the public terminal frame; it is still a valid field.
+        assert_eq!(state.request_id.as_deref(), Some(""));
+        assert_eq!(state.stop_reason.as_deref(), Some("EndTurn"));
+        assert!(state.protocol_error.is_none());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn grok_headless_runner_streams_text_and_captures_terminal_metadata() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _guard = fake_claude_spawn_guard();
+        let temp_dir = tempfile::tempdir()?;
+        let fake_grok = temp_dir.path().join("fake-grok");
+        std::fs::write(
+            &fake_grok,
+            r#"#!/bin/sh
+printf '%s\n' '{"type":"thought","data":"private reasoning"}'
+printf '%s\n' '{"type":"text","data":"hello "}'
+printf '%s\n' '{"type":"text","data":"world"}'
+printf '%s\n' '{"type":"end","stopReason":"EndTurn","sessionId":"session-1","requestId":"request-1"}'
+"#,
+        )?;
+        let mut permissions = std::fs::metadata(&fake_grok)?.permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&fake_grok, permissions)?;
+        let command = HarnessCommand {
+            program: fake_grok.to_string_lossy().into_owned(),
+            args: Vec::new(),
+            cwd: temp_dir.path().to_path_buf(),
+            stdin_prompt: None,
+        };
+        let mut output = String::new();
+
+        let outcome = stream_harness_event_protocol(
+            &command,
+            crate::harness::HarnessEventProtocol::GrokHeadlessV1,
+            Some("session-1"),
+            |text| {
+                output.push_str(text);
+                Ok(())
+            },
+        )?;
+
+        assert_eq!(output, "hello world");
+        assert_eq!(outcome.process.status, "completed");
+        assert_eq!(outcome.process.exit_code, Some(0));
+        assert_eq!(outcome.harness_session_id.as_deref(), Some("session-1"));
+        assert_eq!(outcome.request_id.as_deref(), Some("request-1"));
+        assert_eq!(outcome.stop_reason.as_deref(), Some("EndTurn"));
+        assert!(outcome.error.is_none());
+        assert!(outcome.emitted_assistant);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn grok_headless_runner_fails_fast_on_interactive_auth_prompt() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _guard = fake_claude_spawn_guard();
+        let temp_dir = tempfile::tempdir()?;
+        let fake_grok = temp_dir.path().join("fake-grok-auth");
+        std::fs::write(
+            &fake_grok,
+            r#"#!/bin/sh
+printf '%s\n' 'To sign in, open this URL in your browser:' >&2
+printf '%s\n' 'https://example.invalid/device?user_code=SENSITIVE' >&2
+exec /bin/sleep 30
+"#,
+        )?;
+        let mut permissions = std::fs::metadata(&fake_grok)?.permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&fake_grok, permissions)?;
+        let command = HarnessCommand {
+            program: fake_grok.to_string_lossy().into_owned(),
+            args: Vec::new(),
+            cwd: temp_dir.path().to_path_buf(),
+            stdin_prompt: None,
+        };
+        let started = Instant::now();
+
+        let outcome = stream_harness_event_protocol(
+            &command,
+            crate::harness::HarnessEventProtocol::GrokHeadlessV1,
+            Some("session-1"),
+            |_| Ok(()),
+        )?;
+
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(outcome.process.status, "failed");
+        assert_eq!(outcome.process.exit_code, Some(1));
+        assert_eq!(outcome.error.as_deref(), Some(GROK_HEADLESS_AUTH_ERROR));
+        assert!(!outcome
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("SENSITIVE"));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn grok_headless_daemon_bridge_fails_fast_on_interactive_auth_prompt() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _guard = fake_claude_spawn_guard();
+        let temp_dir = tempfile::tempdir()?;
+        let fake_grok = temp_dir.path().join("fake-grok-auth");
+        std::fs::write(
+            &fake_grok,
+            r#"#!/bin/sh
+printf '%s\n' 'To sign in, open this URL in your browser:' >&2
+printf '%s\n' 'https://example.invalid/device?user_code=SENSITIVE' >&2
+exec /bin/sleep 30
+"#,
+        )?;
+        let mut permissions = std::fs::metadata(&fake_grok)?.permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&fake_grok, permissions)?;
+        let command = HarnessCommand {
+            program: fake_grok.to_string_lossy().into_owned(),
+            args: Vec::new(),
+            cwd: temp_dir.path().to_path_buf(),
+            stdin_prompt: None,
+        };
+        let (output_tx, output_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        let (exit_tx, exit_rx) = std::sync::mpsc::channel::<PtyRunResult>();
+        let started = Instant::now();
+
+        let _session = spawn_harness_event_protocol_with_observer(
+            &command,
+            Some(DetachedPtyObserver {
+                on_output: Box::new(move |chunk| {
+                    let _ = output_tx.send(chunk);
+                }),
+                on_exit: Box::new(move |result| {
+                    let _ = exit_tx.send(result);
+                }),
+            }),
+            crate::harness::HarnessEventProtocol::GrokHeadlessV1,
+            Some("session-1"),
+        )?;
+
+        let outcome = exit_rx.recv_timeout(Duration::from_secs(5))?;
+        let output = String::from_utf8(output_rx.try_iter().flatten().collect())?;
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(outcome.status, "failed");
+        assert_eq!(outcome.exit_code, Some(1));
+        assert!(output.contains(GROK_HEADLESS_AUTH_ERROR));
+        assert!(!output.contains("To sign in"));
+        assert!(!output.contains("SENSITIVE"));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn grok_headless_runner_preserves_stderr_when_process_exits_before_end() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _guard = fake_claude_spawn_guard();
+        let temp_dir = tempfile::tempdir()?;
+        let fake_grok = temp_dir.path().join("fake-grok-missing-session");
+        std::fs::write(
+            &fake_grok,
+            r#"#!/bin/sh
+/bin/sleep 5 >/dev/null &
+printf '%s\n' 'session restore failed: 404 Not Found' >&2
+exit 7
+"#,
+        )?;
+        let mut permissions = std::fs::metadata(&fake_grok)?.permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&fake_grok, permissions)?;
+        let command = HarnessCommand {
+            program: fake_grok.to_string_lossy().into_owned(),
+            args: Vec::new(),
+            cwd: temp_dir.path().to_path_buf(),
+            stdin_prompt: None,
+        };
+        let started = Instant::now();
+
+        let outcome = stream_harness_event_protocol(
+            &command,
+            crate::harness::HarnessEventProtocol::GrokHeadlessV1,
+            Some("session-1"),
+            |_| Ok(()),
+        )?;
+
+        assert!(started.elapsed() < Duration::from_secs(3));
+        assert_eq!(outcome.process.status, "failed");
+        assert_eq!(outcome.process.exit_code, Some(7));
+        let error = outcome.error.as_deref().unwrap_or_default();
+        assert!(error.contains("harness exited with 7 before emitting"));
+        assert!(error.contains("session restore failed: 404 Not Found"));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn grok_headless_daemon_bridge_preserves_stderr_when_process_exits_before_end(
+    ) -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _guard = fake_claude_spawn_guard();
+        let temp_dir = tempfile::tempdir()?;
+        let fake_grok = temp_dir.path().join("fake-grok-missing-session");
+        std::fs::write(
+            &fake_grok,
+            r#"#!/bin/sh
+/bin/sleep 5 >/dev/null &
+printf '%s\n' 'session restore failed: 404 Not Found' >&2
+exit 7
+"#,
+        )?;
+        let mut permissions = std::fs::metadata(&fake_grok)?.permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&fake_grok, permissions)?;
+        let command = HarnessCommand {
+            program: fake_grok.to_string_lossy().into_owned(),
+            args: Vec::new(),
+            cwd: temp_dir.path().to_path_buf(),
+            stdin_prompt: None,
+        };
+        let (output_tx, output_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        let (exit_tx, exit_rx) = std::sync::mpsc::channel::<PtyRunResult>();
+        let started = Instant::now();
+
+        let _session = spawn_harness_event_protocol_with_observer(
+            &command,
+            Some(DetachedPtyObserver {
+                on_output: Box::new(move |chunk| {
+                    let _ = output_tx.send(chunk);
+                }),
+                on_exit: Box::new(move |result| {
+                    let _ = exit_tx.send(result);
+                }),
+            }),
+            crate::harness::HarnessEventProtocol::GrokHeadlessV1,
+            Some("session-1"),
+        )?;
+
+        let outcome = exit_rx.recv_timeout(Duration::from_secs(5))?;
+        let output = String::from_utf8(output_rx.try_iter().flatten().collect())?;
+        assert!(started.elapsed() < Duration::from_secs(3));
+        assert_eq!(outcome.status, "failed");
+        assert_eq!(outcome.exit_code, Some(7));
+        assert!(output.contains("harness exited with 7 before emitting"));
+        assert!(output.contains("session restore failed: 404 Not Found"));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn grok_headless_runner_bounds_a_descendant_held_stdout_pipe() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _guard = fake_claude_spawn_guard();
+        let temp_dir = tempfile::tempdir()?;
+        let fake_grok = temp_dir.path().join("fake-grok-held-stdout");
+        std::fs::write(
+            &fake_grok,
+            r#"#!/bin/sh
+printf '%s\n' '{"type":"end","stopReason":"EndTurn","sessionId":"session-1","requestId":"request-1"}'
+/bin/sleep 5 2>/dev/null &
+exit 0
+"#,
+        )?;
+        let mut permissions = std::fs::metadata(&fake_grok)?.permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&fake_grok, permissions)?;
+        let command = HarnessCommand {
+            program: fake_grok.to_string_lossy().into_owned(),
+            args: Vec::new(),
+            cwd: temp_dir.path().to_path_buf(),
+            stdin_prompt: None,
+        };
+        let started = Instant::now();
+
+        let outcome = stream_harness_event_protocol(
+            &command,
+            crate::harness::HarnessEventProtocol::GrokHeadlessV1,
+            Some("session-1"),
+            |_| Ok(()),
+        )?;
+
+        assert!(started.elapsed() < Duration::from_secs(3));
+        assert_eq!(outcome.process.status, "failed");
+        assert_eq!(outcome.process.exit_code, Some(1));
+        assert!(outcome
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("output pipe remained open")));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn grok_headless_daemon_bridge_bounds_a_descendant_held_stdout_pipe() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _guard = fake_claude_spawn_guard();
+        let temp_dir = tempfile::tempdir()?;
+        let fake_grok = temp_dir.path().join("fake-grok-held-stdout");
+        std::fs::write(
+            &fake_grok,
+            r#"#!/bin/sh
+printf '%s\n' '{"type":"end","stopReason":"EndTurn","sessionId":"session-1","requestId":"request-1"}'
+/bin/sleep 5 2>/dev/null &
+exit 0
+"#,
+        )?;
+        let mut permissions = std::fs::metadata(&fake_grok)?.permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&fake_grok, permissions)?;
+        let command = HarnessCommand {
+            program: fake_grok.to_string_lossy().into_owned(),
+            args: Vec::new(),
+            cwd: temp_dir.path().to_path_buf(),
+            stdin_prompt: None,
+        };
+        let (output_tx, output_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        let (exit_tx, exit_rx) = std::sync::mpsc::channel::<PtyRunResult>();
+        let started = Instant::now();
+
+        let _session = spawn_harness_event_protocol_with_observer(
+            &command,
+            Some(DetachedPtyObserver {
+                on_output: Box::new(move |chunk| {
+                    let _ = output_tx.send(chunk);
+                }),
+                on_exit: Box::new(move |result| {
+                    let _ = exit_tx.send(result);
+                }),
+            }),
+            crate::harness::HarnessEventProtocol::GrokHeadlessV1,
+            Some("session-1"),
+        )?;
+
+        let outcome = exit_rx.recv_timeout(Duration::from_secs(5))?;
+        let output = String::from_utf8(output_rx.try_iter().flatten().collect())?;
+        assert!(started.elapsed() < Duration::from_secs(3));
+        assert_eq!(outcome.status, "failed");
+        assert_eq!(outcome.exit_code, Some(1));
+        assert!(output.contains("output pipe remained open"));
+        Ok(())
+    }
+
+    #[test]
+    fn grok_headless_parser_rejects_a_different_returned_session_id() -> anyhow::Result<()> {
+        let protocol = crate::harness::HarnessEventProtocol::GrokHeadlessV1;
+        let mut state = HarnessEventState::default();
+        handle_harness_event_line(
+            protocol,
+            r#"{"type":"end","stopReason":"EndTurn","sessionId":"other","requestId":"request-1"}"#,
+            &mut state,
+            &mut |_| Ok(()),
+        )?;
+        finalize_harness_event_state(&mut state, protocol, Some("assigned"));
+
+        assert_eq!(
+            state.protocol_error.as_deref(),
+            Some("harness returned session id `other` after Coven assigned `assigned`")
+        );
+        Ok(())
     }
 
     #[cfg(unix)]

@@ -11,6 +11,7 @@ use std::process::{Command, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use anyhow::Context;
 use serde_json::{json, Value};
 
 #[test]
@@ -818,8 +819,223 @@ fn adapter_install_hermes_writes_trusted_manifest() -> anyhow::Result<()> {
     assert_stdout_contains(
         "adapter doctor hermes",
         &doctor,
-        "Adapter doctor found unavailable adapters",
+        "Adapter doctor found unavailable or incompatible adapters",
     );
+    Ok(())
+}
+
+#[test]
+fn adapter_install_grok_writes_trusted_manifest() -> anyhow::Result<()> {
+    let temp_dir = tempfile::tempdir()?;
+    let coven_home = temp_dir.path().join("coven-home");
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let coven = coven_bin();
+
+    let install = run_coven(&coven, &coven_home, &path, &["adapter", "install", "grok"])?;
+
+    assert_success("adapter install grok", &install);
+    assert_stdout_contains("adapter install grok", &install, "Installed adapter `grok`");
+    let manifest_path = coven_home.join("adapters").join("grok.json");
+    let manifest = serde_json::from_str::<Value>(&fs::read_to_string(manifest_path)?)?;
+    let adapter = manifest
+        .get("adapters")
+        .and_then(Value::as_array)
+        .and_then(|adapters| adapters.first())
+        .expect("installed manifest should include one adapter");
+    assert_eq!(adapter.get("id").and_then(Value::as_str), Some("grok"));
+    assert_eq!(
+        adapter.get("executable").and_then(Value::as_str),
+        Some("grok")
+    );
+    assert_eq!(
+        adapter.get("prompt_flag").and_then(Value::as_str),
+        Some("--single")
+    );
+    assert_eq!(
+        adapter.get("event_protocol").and_then(Value::as_str),
+        Some("grok-headless-v1")
+    );
+    assert_eq!(
+        adapter
+            .get("non_interactive_prompt_prefix_args")
+            .and_then(Value::as_array)
+            .and_then(|args| args.last())
+            .and_then(Value::as_str),
+        Some("streaming-json")
+    );
+
+    // Keep diagnosis independent of whether Grok Build is installed on the
+    // contributor's machine.
+    let doctor = run_coven(
+        &coven,
+        &coven_home,
+        &OsString::new(),
+        &["adapter", "doctor", "grok"],
+    )?;
+    assert_failure("adapter doctor grok", &doctor);
+    assert_stdout_contains("adapter doctor grok", &doctor, "Grok Build");
+    assert_stdout_contains("adapter doctor grok", &doctor, "manifest:");
+    Ok(())
+}
+
+#[test]
+fn grok_adapter_translates_headless_events_and_resumes_the_assigned_session() -> anyhow::Result<()>
+{
+    let temp_dir = tempfile::tempdir()?;
+    let coven_home = temp_dir.path().join("coven-home");
+    let fake_bin = temp_dir.path().join("bin");
+    let repo = temp_dir.path().join("repo");
+    let arg_log = temp_dir.path().join("grok-args.log");
+    fs::create_dir_all(&fake_bin)?;
+    fs::create_dir_all(&repo)?;
+    init_git_repo(&repo)?;
+    write_fake_grok(&fake_bin)?;
+    let path = prepend_path(&fake_bin);
+    let coven = coven_bin();
+
+    let install = run_coven(&coven, &coven_home, &path, &["adapter", "install", "grok"])?;
+    assert_success("adapter install grok", &install);
+    let doctor = run_coven(&coven, &coven_home, &path, &["adapter", "doctor", "grok"])?;
+    assert_success("adapter doctor compatible Grok", &doctor);
+    assert_stdout_contains(
+        "adapter doctor compatible Grok",
+        &doctor,
+        "Grok headless JSONL contract verified",
+    );
+
+    let arg_log_value = arg_log.to_string_lossy().into_owned();
+    let first = run_coven_in(
+        &coven,
+        &coven_home,
+        &path,
+        &repo,
+        &[("FAKE_GROK_ARG_LOG", arg_log_value.as_str())],
+        &["run", "grok", "first turn"],
+    )?;
+    assert_success("first Grok turn", &first);
+    assert_stdout_contains("first Grok turn", &first, "first reply");
+    assert_stdout_not_contains("first Grok turn", &first, "private reasoning");
+    assert_stdout_not_contains("first Grok turn", &first, r#""type":"end""#);
+    let first_stdout = String::from_utf8_lossy(&first.stdout);
+    let session_id = first_stdout
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("id:").map(str::trim))
+        .filter(|id| !id.is_empty())
+        .context("first Grok turn should print the Coven session id")?
+        .to_string();
+
+    let second = run_coven_in(
+        &coven,
+        &coven_home,
+        &path,
+        &repo,
+        &[("FAKE_GROK_ARG_LOG", arg_log_value.as_str())],
+        &[
+            "run",
+            "grok",
+            "--continue",
+            session_id.as_str(),
+            "second turn",
+            "--stream-json",
+        ],
+    )?;
+    assert_success("resumed Grok turn", &second);
+    let second_stdout = String::from_utf8(second.stdout)?;
+    let frames = second_stdout
+        .lines()
+        .map(serde_json::from_str::<Value>)
+        .collect::<Result<Vec<_>, _>>()?;
+    assert!(frames.iter().any(|frame| {
+        frame.get("type").and_then(Value::as_str) == Some("assistant")
+            && frame
+                .pointer("/message/content/0/text")
+                .and_then(Value::as_str)
+                == Some("resumed reply")
+    }));
+    let result = frames
+        .iter()
+        .find(|frame| frame.get("type").and_then(Value::as_str) == Some("result"))
+        .context("resumed Grok turn should emit a Coven result frame")?;
+    assert_eq!(
+        result.get("harness_session_id").and_then(Value::as_str),
+        Some(session_id.as_str())
+    );
+    assert_eq!(result.get("is_error").and_then(Value::as_bool), Some(false));
+    assert!(!second_stdout.contains("private reasoning"));
+    assert!(!second_stdout.contains(r#""type":"end""#));
+
+    let invocations = fs::read_to_string(&arg_log)?;
+    let launches = invocations.split("BEGIN\n").skip(1).collect::<Vec<_>>();
+    assert_eq!(launches.len(), 2, "expected one Grok process per turn");
+    assert!(launches[0].contains(&format!("--session-id\n{session_id}\n")));
+    assert!(launches[1].contains(&format!("--resume\n{session_id}\n")));
+    assert!(launches
+        .iter()
+        .all(|launch| launch.contains("--output-format\nstreaming-json\n")));
+    Ok(())
+}
+
+#[test]
+fn grok_adapter_translates_events_through_the_daemon() -> anyhow::Result<()> {
+    let temp_dir = tempfile::tempdir()?;
+    let coven_home = temp_dir.path().join("coven-home");
+    let fake_bin = temp_dir.path().join("bin");
+    let project_root = temp_dir.path().join("project");
+    fs::create_dir_all(&fake_bin)?;
+    fs::create_dir_all(&project_root)?;
+    write_fake_grok(&fake_bin)?;
+    let path = prepend_path(&fake_bin);
+    let coven = coven_bin();
+    let install = run_coven(&coven, &coven_home, &path, &["adapter", "install", "grok"])?;
+    assert_success("adapter install grok", &install);
+    let _daemon_guard = DaemonGuard {
+        coven: coven.clone(),
+        coven_home: coven_home.clone(),
+        path: path.clone(),
+    };
+    let start = run_coven(&coven, &coven_home, &path, &["daemon", "start"])?;
+    assert_success("daemon start for Grok", &start);
+    wait_for_daemon_health(&coven_home)?;
+
+    // The API does not need to understand Grok's preassigned-session flag:
+    // the daemon derives an init hint from the new Coven session id.
+    let first = launch_daemon_session(
+        &coven_home,
+        &project_root,
+        "grok",
+        "first daemon turn",
+        "Grok daemon first turn",
+    )?;
+    wait_for_session_status(&coven_home, &first, "completed")?;
+    wait_for_event_text(&coven_home, &first, "first reply")?;
+    let (_, first_events) = unix_http_request(
+        &coven_home,
+        "GET",
+        &format!("/events?sessionId={first}"),
+        None,
+    )?;
+    assert!(!first_events.contains("private reasoning"));
+    assert!(!first_events.contains(r#"\"type\":\"end\""#));
+
+    let resumed = launch_daemon_session_with_conversation(
+        &coven_home,
+        &project_root,
+        "grok",
+        "second daemon turn",
+        "Grok daemon resumed turn",
+        "resume",
+        &first,
+    )?;
+    wait_for_session_status(&coven_home, &resumed, "idle")?;
+    wait_for_event_text(&coven_home, &resumed, "resumed reply")?;
+    let (_, resumed_events) = unix_http_request(
+        &coven_home,
+        "GET",
+        &format!("/events?sessionId={resumed}"),
+        None,
+    )?;
+    assert!(!resumed_events.contains("private reasoning"));
+    assert!(!resumed_events.contains(r#"\"type\":\"end\""#));
     Ok(())
 }
 
@@ -1246,6 +1462,58 @@ printf 'fake codex complete: %s\n' "$*"
     Ok(())
 }
 
+fn write_fake_grok(fake_bin: &Path) -> anyhow::Result<()> {
+    let grok = fake_bin.join("grok");
+    fs::write(
+        &grok,
+        r#"#!/bin/sh
+if [ -n "$FAKE_GROK_ARG_LOG" ]; then
+  printf 'BEGIN\n' >> "$FAKE_GROK_ARG_LOG"
+  for arg in "$@"; do
+    printf '%s\n' "$arg" >> "$FAKE_GROK_ARG_LOG"
+  done
+fi
+
+for arg in "$@"; do
+  if [ "$arg" = '--help' ]; then
+    printf '%s\n' '--single --output-format streaming-json --no-alt-screen --session-id --resume --model --permission-mode --sandbox --rules'
+    exit 0
+  fi
+done
+
+session_id=''
+mode=''
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --session-id|--resume)
+      mode="$1"
+      shift
+      session_id="$1"
+      ;;
+  esac
+  shift
+done
+
+if [ -z "$session_id" ]; then
+  printf '%s\n' '{"type":"error","message":"missing Coven session id"}'
+  exit 2
+fi
+
+printf '%s\n' '{"type":"thought","data":"private reasoning"}'
+if [ "$mode" = '--resume' ]; then
+  printf '%s\n' '{"type":"text","data":"resumed reply"}'
+else
+  printf '%s\n' '{"type":"text","data":"first reply"}'
+fi
+printf '{"type":"end","stopReason":"EndTurn","sessionId":"%s","requestId":"request-1"}\n' "$session_id"
+"#,
+    )?;
+    let mut permissions = fs::metadata(&grok)?.permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&grok, permissions)?;
+    Ok(())
+}
+
 /// Doctor exits 1 when coven-code is missing, so doctor tests that expect a
 /// healthy environment plant a fake alongside the fake harness.
 fn write_fake_coven_code(fake_bin: &Path) -> anyhow::Result<()> {
@@ -1301,6 +1569,40 @@ fn launch_daemon_session(
         "harness": harness,
         "prompt": prompt,
         "title": title
+    })
+    .to_string();
+    let (status, response_body) = unix_http_request(coven_home, "POST", "/sessions", Some(&body))?;
+    assert_eq!(
+        status, 201,
+        "unexpected session launch response: {response_body}"
+    );
+    Ok(serde_json::from_str::<Value>(&response_body)?
+        .get("id")
+        .and_then(Value::as_str)
+        .expect("daemon response should include session id")
+        .to_string())
+}
+
+fn launch_daemon_session_with_conversation(
+    coven_home: &Path,
+    project_root: &Path,
+    harness: &str,
+    prompt: &str,
+    title: &str,
+    mode: &str,
+    conversation_id: &str,
+) -> anyhow::Result<String> {
+    let body = json!({
+        "projectRoot": project_root,
+        "cwd": project_root,
+        "harness": harness,
+        // Deliberately request interactive: an event-protocol adapter must
+        // still be forced onto its finite headless pipe bridge by the daemon.
+        "launchMode": "interactive",
+        "prompt": prompt,
+        "title": title,
+        "conversation": {"mode": mode, "id": conversation_id},
+        "conversationId": conversation_id,
     })
     .to_string();
     let (status, response_body) = unix_http_request(coven_home, "POST", "/sessions", Some(&body))?;

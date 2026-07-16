@@ -140,7 +140,7 @@ enum Command {
     },
     #[command(about = "Launch a project-scoped harness session")]
     Run {
-        #[arg(help = "Harness to run: codex or claude")]
+        #[arg(help = "Configured harness adapter id (for example codex or claude)")]
         harness: String,
         #[arg(help = "Task for the harness", required = false, num_args = 0..)]
         prompt: Vec<String>,
@@ -1856,6 +1856,61 @@ fn run_adapter_list(json: bool) -> Result<()> {
     Ok(())
 }
 
+fn probe_adapter_event_protocol(
+    adapter: &harness::HarnessSummary,
+) -> std::result::Result<Option<String>, String> {
+    if !adapter.available {
+        return Ok(None);
+    }
+    match adapter.event_protocol {
+        None => Ok(None),
+        Some(harness::HarnessEventProtocol::GrokHeadlessV1) => {
+            let program = harness::spawn_executable_for_platform(&adapter.executable);
+            let output = std::process::Command::new(&program)
+                .args(["--no-auto-update", "--help"])
+                .stdin(std::process::Stdio::null())
+                .output()
+                .map_err(|error| {
+                    format!("failed to run `{program} --no-auto-update --help`: {error}")
+                })?;
+            if !output.status.success() {
+                return Err(format!(
+                    "`{program} --no-auto-update --help` exited with {}",
+                    output.status
+                ));
+            }
+            let help = format!(
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let required = [
+                "--single",
+                "--output-format",
+                "streaming-json",
+                "--no-alt-screen",
+                "--session-id",
+                "--resume",
+                "--model",
+                "--permission-mode",
+                "--sandbox",
+                "--rules",
+            ];
+            let missing = required
+                .into_iter()
+                .filter(|flag| !help.contains(flag))
+                .collect::<Vec<_>>();
+            if !missing.is_empty() {
+                return Err(format!(
+                    "installed Grok Build does not advertise the required headless contract: {}",
+                    missing.join(", ")
+                ));
+            }
+            Ok(Some("Grok headless JSONL contract verified".to_string()))
+        }
+    }
+}
+
 fn run_adapter_doctor(adapter: Option<&str>, json: bool) -> Result<()> {
     let harnesses = harness::configured_harnesses()?;
     let filtered: Vec<_> = match adapter {
@@ -1874,21 +1929,44 @@ fn run_adapter_doctor(adapter: Option<&str>, json: bool) -> Result<()> {
         }
     }
 
-    let ok = filtered.iter().all(|harness| harness.available);
+    let probes = filtered
+        .iter()
+        .map(probe_adapter_event_protocol)
+        .collect::<Vec<_>>();
+    let ok = filtered
+        .iter()
+        .zip(&probes)
+        .all(|(harness, probe)| harness.available && probe.is_ok());
     if json {
         let checks: Vec<DoctorCheck> = filtered
             .iter()
-            .map(|harness| {
-                if harness.available {
-                    DoctorCheck::pass(
-                        format!("adapter:{}", harness.id),
-                        format!("`{}` is ready", harness.executable),
-                    )
-                } else {
+            .zip(&probes)
+            .map(|(harness, probe)| {
+                if !harness.available {
                     DoctorCheck::fail(
                         format!("adapter:{}", harness.id),
                         format!("`{}` is missing", harness.executable),
                         Some(harness.install_hint.trim().to_string()),
+                    )
+                } else if let Err(error) = probe {
+                    DoctorCheck::fail(
+                        format!("adapter:{}", harness.id),
+                        format!(
+                            "`{}` is present but incompatible: {error}",
+                            harness.executable
+                        ),
+                        Some(harness.install_hint.trim().to_string()),
+                    )
+                } else {
+                    let detail = probe
+                        .as_ref()
+                        .ok()
+                        .and_then(|detail| detail.as_deref())
+                        .map(|detail| format!("; {detail}"))
+                        .unwrap_or_default();
+                    DoctorCheck::pass(
+                        format!("adapter:{}", harness.id),
+                        format!("`{}` is ready{detail}", harness.executable),
                     )
                 }
             })
@@ -1908,12 +1986,13 @@ fn run_adapter_doctor(adapter: Option<&str>, json: bool) -> Result<()> {
     }
 
     println!("Coven adapter doctor");
-    for harness in &filtered {
-        let marker = if harness.available { "OK" } else { "!!" };
-        let status = if harness.available {
-            "ready"
+    for (harness, probe) in filtered.iter().zip(&probes) {
+        let (marker, status) = if !harness.available {
+            ("!!", "missing".to_string())
+        } else if let Err(error) = probe {
+            ("!!", format!("present but incompatible: {error}"))
         } else {
-            "missing"
+            ("OK", "ready".to_string())
         };
         println!(
             "  [{marker}] {:<18} `{}` is {status}",
@@ -1924,10 +2003,17 @@ fn run_adapter_doctor(adapter: Option<&str>, json: bool) -> Result<()> {
         }
         if !harness.available {
             println!("       {}", harness.install_hint);
+        } else if let Err(error) = probe {
+            println!("       {error}");
+            println!("       {}", harness.install_hint);
+        } else if let Ok(Some(detail)) = probe {
+            println!("       {detail}");
         }
     }
     if !ok {
-        println!("\nAdapter doctor found unavailable adapters; see the [!!] lines above.");
+        println!(
+            "\nAdapter doctor found unavailable or incompatible adapters; see the [!!] lines above."
+        );
         exit_checks_failed();
     }
     Ok(())
@@ -3146,6 +3232,13 @@ fn run_session(
             record.id.clone()
         };
         Some(harness::ConversationHint::Resume { id: resume_id })
+    } else if spec
+        .as_ref()
+        .is_some_and(|spec| spec.capabilities.preassigned_session_id)
+    {
+        Some(harness::ConversationHint::Init {
+            id: record.id.clone(),
+        })
     } else {
         None
     };
@@ -3157,7 +3250,11 @@ fn run_session(
         .as_ref()
         .filter(|s| s.system_prompt_flag.is_some())
         .and(familiar_ctx.as_ref());
-    let launch_mode = if stream_json {
+    let launch_mode = if stream_json
+        || spec
+            .as_ref()
+            .is_some_and(|spec| spec.event_protocol.is_some())
+    {
         // stream-json is a machine protocol: always launch one-shot.
         harness::HarnessLaunchMode::NonInteractive
     } else {
@@ -3184,6 +3281,118 @@ fn run_session(
             launch_options,
         )?
     };
+    if let Some(protocol) = spec.as_ref().and_then(|spec| spec.event_protocol) {
+        let output_session_id = record.id.clone();
+        let outcome = pty_runner::stream_harness_event_protocol(
+            &command,
+            protocol,
+            conversation_hint.as_ref().map(|hint| hint.id()),
+            move |text| {
+                if stream_json {
+                    emit_stream_event(&stream_json::Event::Assistant(
+                        stream_json::AssistantMessage {
+                            message: stream_json::MessageBody {
+                                role: "assistant".into(),
+                                content: vec![stream_json::ContentBlock::Text {
+                                    text: text.to_string(),
+                                }],
+                            },
+                            session_id: output_session_id.clone(),
+                            stop_reason: None,
+                        },
+                    ))
+                } else {
+                    print!("{text}");
+                    io::stdout()
+                        .flush()
+                        .context("failed flushing harness output")
+                }
+            },
+        );
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                store::update_session_status(
+                    &conn,
+                    &record.id,
+                    FAILED_SESSION_STATUS,
+                    None,
+                    &current_timestamp(),
+                )?;
+                if stream_json {
+                    emit_stream_event(&stream_json::Event::Result(stream_json::RunResult {
+                        subtype: "error_during_execution".into(),
+                        duration_ms: stream_started.elapsed().as_millis() as u64,
+                        is_error: true,
+                        num_turns: 1,
+                        session_id: record.id.clone(),
+                        harness_session_id: None,
+                        error: Some(format!("{error:#}")),
+                    }))?;
+                }
+                return Err(error);
+            }
+        };
+        if outcome.emitted_assistant && !stream_json {
+            println!();
+        }
+        if outcome.error.is_none() {
+            if let Some(harness_session_id) = outcome.harness_session_id.as_deref() {
+                store::update_session_conversation_id(
+                    &conn,
+                    &record.id,
+                    harness_session_id,
+                    &current_timestamp(),
+                )?;
+            }
+        }
+        let is_error =
+            outcome.error.is_some() || outcome.process.exit_code.is_some_and(|code| code != 0);
+        store::update_session_status(
+            &conn,
+            &record.id,
+            if is_error {
+                FAILED_SESSION_STATUS
+            } else {
+                outcome.process.status
+            },
+            outcome.process.exit_code,
+            &current_timestamp(),
+        )?;
+        if stream_json {
+            emit_stream_event(&stream_json::Event::Result(stream_json::RunResult {
+                subtype: if is_error {
+                    "error_during_execution".into()
+                } else {
+                    "success".into()
+                },
+                duration_ms: stream_started.elapsed().as_millis() as u64,
+                is_error,
+                num_turns: 1,
+                session_id: record.id.clone(),
+                harness_session_id: outcome.harness_session_id.clone(),
+                error: outcome.error.clone(),
+            }))?;
+        } else if let Some(error) = outcome.error.as_deref() {
+            eprintln!("{error}");
+        }
+        if archive {
+            let archived_at = current_timestamp();
+            store::archive_session(&conn, &record.id, &archived_at)?;
+            if !stream_json {
+                println!("Archived session {} at {archived_at}", record.id);
+            }
+        }
+        if is_error {
+            let exit_code = outcome
+                .process
+                .exit_code
+                .filter(|code| *code != 0)
+                .unwrap_or(1);
+            exit_with_session_code(exit_code, stream_json);
+        }
+        return Ok(());
+    }
     if stream_json && selected_harness.id == "codex" {
         let output_session_id = record.id.clone();
         let outcome = pty_runner::stream_codex_json(&command, move |text| {
@@ -5442,6 +5651,7 @@ mod tests {
             available,
             install_hint: String::new(),
             capabilities: coven_runtime_spec::Capabilities::BASELINE,
+            event_protocol: None,
             source: "built-in".to_string(),
             manifest_path: None,
         }
@@ -5517,6 +5727,7 @@ mod tests {
             available,
             install_hint: install_hint.to_string(),
             capabilities: coven_runtime_spec::Capabilities::BASELINE,
+            event_protocol: None,
             source: "built-in".to_string(),
             manifest_path: None,
         }

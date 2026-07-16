@@ -1,14 +1,14 @@
 ---
-summary: "Coven launches and supervises coding-agent CLIs through PTY adapters. Each harness keeps its own provider auth."
+summary: "Coven launches and supervises coding-agent CLIs through reviewed adapters. Each harness keeps its own provider auth."
 read_when:
   - Browsing what runtimes Coven can drive
   - Choosing which harness to install first
 title: "Harnesses"
-description: "Coven supports coding-agent CLIs as harnesses through PTY adapters. Each harness keeps its own provider authentication and command surface."
+description: "Coven supports coding-agent CLIs as harnesses through reviewed process adapters. Each harness keeps its own provider authentication and command surface."
 ---
 
 
-A **harness** is an external coding-agent CLI that Coven can launch and supervise inside an explicit project root. Coven owns the PTY, the session record, and the event log; the harness owns the conversation, the tool calls, and provider authentication.
+A **harness** is an external coding-agent CLI that Coven can launch and supervise inside an explicit project root. Coven owns the process transport, session record, and event log; the harness owns the conversation, tool calls, and provider authentication. Interactive adapters use a PTY, while reviewed finite headless protocols such as Grok Build use structured pipes.
 
 <Columns>
   <Card title="Codex" href="/harnesses/codex" icon="binary">
@@ -19,6 +19,9 @@ A **harness** is an external coding-agent CLI that Coven can launch and supervis
   </Card>
   <Card title="Copilot CLI" href="/harnesses/copilot-cli" icon="github">
     GitHub Copilot CLI. Harness id `copilot`.
+  </Card>
+  <Card title="Grok Build (experimental)" href="/harnesses/grok-build" icon="terminal">
+    Trusted xAI Grok Build recipe. Installable harness id `grok`.
   </Card>
   <Card title="OpenClaw bridge" href="/harnesses/openclaw" icon="plug">
     External ACP runtime bridge through external OpenClaw bridge plugin.
@@ -36,19 +39,22 @@ flowchart LR
   Adapter --> CodexAdapter[Codex adapter]
   Adapter --> ClaudeAdapter[Claude adapter]
   Adapter --> CopilotAdapter[Copilot adapter]
+  Adapter -. recipe .-> GrokAdapter[Grok Build adapter]
   Adapter -. future .-> Future[Hermes / Aider / Gemini]
   OpenClaw[OpenClaw] --> Bridge["OpenClaw bridge plugin"]
   Bridge --> Coven
   CodexAdapter --> CodexPty[Codex PTY]
   ClaudeAdapter --> ClaudePty[Claude Code PTY]
   CopilotAdapter --> CopilotPty[Copilot CLI PTY]
+  GrokAdapter --> GrokJson[Grok headless JSONL]
+  GrokJson --> GrokBridge[Coven event translator]
 ```
 
 ## What every harness has in common
 
 - A stable **harness id** that clients pass to `coven run` or `POST /api/v1/sessions`.
 - A guaranteed launch inside a canonical **project root**.
-- A Coven-owned PTY for I/O, replay, and `coven attach`.
+- A Coven-owned process transport: a PTY for interactive I/O and `coven attach`, or a reviewed structured pipe for finite headless runs.
 - An append-only event stream stored under the session id.
 - The same **rituals**: archive, summon, sacrifice.
 
@@ -88,9 +94,12 @@ See [Provider auth boundary](/harnesses/provider-auth) for the credential-isolat
 
 If `coven doctor` reports a harness as missing, see [Installing harness CLIs](/harnesses/installing).
 
+Grok Build is an experimental opt-in recipe rather than a bundled default. See [Grok Build](/harnesses/grok-build) for its separate CLI and adapter installation steps.
+
 ## Related
 
 - [Provider auth boundary](/harnesses/provider-auth)
 - [OpenClaw bridge](/harnesses/openclaw)
+- [Grok Build adapter](/harnesses/grok-build)
 - [Harness adapter guide](/HARNESS-ADAPTERS)
 - [Future harness notes](/FUTURE-HARNESSES)

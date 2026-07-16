@@ -1104,7 +1104,8 @@ impl App {
 
     /// Decide whether a launch for `harness` should ride a resumable chat
     /// session, and if so produce the right hint. For harnesses where we can
-    /// pre-assign the session id (claude/copilot `--session-id`) the first
+    /// pre-assign the session id (for example claude, copilot, and trusted
+    /// adapters with `--session-id`) the first
     /// turn sends
     /// `Init` with a freshly generated UUID. For harnesses that auto-assign
     /// (codex) the first turn sends no hint and the id is captured from
@@ -2225,7 +2226,8 @@ fn should_keep_launch_inline(plan: &CastPlan) -> bool {
 /// turn's conversation via the harness CLI's session-resume mechanism. See
 /// `docs/chat-persistence.md` for the per-harness mechanics.
 fn harness_supports_chat_resume(harness: &str) -> bool {
-    matches!(harness, "claude" | "codex" | "copilot")
+    harness::harness_supports_one_shot_resume(harness)
+        || harness::harness_supports_stream_mode(harness)
 }
 
 /// Whether `data` (a chunk of harness output) indicates the harness rejected

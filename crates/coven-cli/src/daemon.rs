@@ -252,12 +252,31 @@ impl SessionRuntime for LiveSessionRuntime {
             }
             (None, None) => None,
         };
+        let adapter = crate::harness::configured_harness_specs()?
+            .into_iter()
+            .find(|spec| spec.id == launch.harness);
+        let event_protocol = adapter.as_ref().and_then(|spec| spec.event_protocol);
+        let conversation = launch.conversation.clone().or_else(|| {
+            adapter
+                .as_ref()
+                .filter(|spec| spec.capabilities.preassigned_session_id)
+                .map(|_| crate::harness::ConversationHint::Init {
+                    id: launch.id.clone(),
+                })
+        });
+        let launch_mode = if event_protocol.is_some() {
+            // A declared event protocol is a finite headless process even when
+            // the API caller itself is attached to a terminal.
+            crate::harness::HarnessLaunchMode::NonInteractive
+        } else {
+            launch.launch_mode
+        };
         let command = pty_runner::build_harness_command_with_conversation(
             &launch.harness,
             &launch.prompt,
             Path::new(&launch.cwd),
-            launch.launch_mode,
-            launch.conversation.as_ref(),
+            launch_mode,
+            conversation.as_ref(),
             familiar_ctx.as_ref(),
             // The daemon launch path does not carry model/think/speed selection
             // yet; `coven run` drives those foreground flags.
@@ -268,7 +287,23 @@ impl SessionRuntime for LiveSessionRuntime {
             .as_ref()
             .map(|coven_home| output_observer(coven_home.to_path_buf(), launch.id.clone()));
 
-        if launch.launch_mode == crate::harness::HarnessLaunchMode::Stream {
+        if let Some(protocol) = event_protocol {
+            let piped = pty_runner::spawn_harness_event_protocol_with_observer(
+                &command,
+                observer,
+                protocol,
+                conversation.as_ref().map(|hint| hint.id()),
+            )?;
+            let killer = piped_killer(piped.pid);
+            return self.register_kind(
+                launch.id.clone(),
+                LiveSessionKind::Pty,
+                piped.input,
+                killer,
+            );
+        }
+
+        if launch_mode == crate::harness::HarnessLaunchMode::Stream {
             // Defense in depth: only allow Stream mode for harnesses that
             // actually have a stream-json entrypoint. Without this check
             // the chat's local gating could be bypassed by another client
@@ -316,7 +351,7 @@ impl SessionRuntime for LiveSessionRuntime {
         // machine-drained. Ordinary pipes match direct `codex exec`, preserve
         // output observation, and let the child reach a real exit status.
         #[cfg(windows)]
-        if launch.launch_mode == crate::harness::HarnessLaunchMode::NonInteractive {
+        if launch_mode == crate::harness::HarnessLaunchMode::NonInteractive {
             let piped = pty_runner::spawn_piped_with_observer(&command, observer, false)?;
             let killer = piped_killer(piped.pid);
             return self.register_kind(
@@ -332,7 +367,7 @@ impl SessionRuntime for LiveSessionRuntime {
         // task sessions don't stall on it. No-op for other harnesses and for
         // `-p`/stream modes, which skip the dialog.
         if launch.harness == "claude"
-            && launch.launch_mode == crate::harness::HarnessLaunchMode::Interactive
+            && launch_mode == crate::harness::HarnessLaunchMode::Interactive
         {
             ensure_claude_trusts_dir(&launch.cwd);
         }

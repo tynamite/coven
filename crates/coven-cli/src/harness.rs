@@ -20,6 +20,8 @@ pub struct HarnessSummary {
     pub available: bool,
     pub install_hint: String,
     pub capabilities: Capabilities,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub event_protocol: Option<HarnessEventProtocol>,
     pub source: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub manifest_path: Option<String>,
@@ -47,6 +49,18 @@ pub enum HarnessLaunchMode {
     ///   chat layer is the only caller that requests Stream today and
     ///   already gates on `harness_supports_stream_mode` before doing so.
     Stream,
+}
+
+/// Machine-readable stdout protocol emitted by a one-shot harness process.
+///
+/// Unlike [`HarnessLaunchMode::Stream`], these protocols do not keep the
+/// harness alive across turns. Coven starts a fresh headless process for each
+/// prompt, translates its events, and uses `continuity_args` for the next turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum HarnessEventProtocol {
+    /// Grok Build's public `--output-format streaming-json` schema.
+    GrokHeadlessV1,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -162,6 +176,18 @@ fn declared_capabilities(harness_id: &str) -> Capabilities {
 /// with process groups; Windows uses a Job Object owned by the daemon.
 pub fn harness_supports_stream_mode(harness_id: &str) -> bool {
     declared_capabilities(harness_id).stream
+}
+
+/// Whether a harness declares a cold-start resume command for later turns.
+/// This stays data-driven so trusted adapters receive the same chat continuity
+/// behavior as bundled harnesses.
+pub fn harness_supports_one_shot_resume(harness_id: &str) -> bool {
+    configured_harness_specs()
+        .unwrap_or_else(|_| built_in_harness_specs())
+        .into_iter()
+        .find(|spec| spec.id == harness_id)
+        .and_then(|spec| spec.continuity_args)
+        .is_some_and(|args| args.has_resume_launch())
 }
 
 /// Hint passed when a chat turn wants to participate in a multi-turn
@@ -283,6 +309,10 @@ pub struct HarnessCommandSpec {
     /// `stream_args` for cold-started turns: adapters declare how to initialize
     /// or resume an upstream conversation without Coven hardcoding ids.
     pub continuity_args: Option<ContinuityArgs>,
+    /// Optional machine-readable event protocol for one-shot headless runs.
+    /// Declaring one forces the foreground CLI onto ordinary pipes and lets
+    /// Coven translate native frames instead of leaking JSON through a PTY.
+    pub event_protocol: Option<HarnessEventProtocol>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -479,6 +509,7 @@ impl HarnessSummary {
             source: spec.source,
             manifest_path: spec.manifest_path,
             capabilities: spec.capabilities,
+            event_protocol: spec.event_protocol,
         }
     }
 }
@@ -570,6 +601,7 @@ pub fn built_in_harness_specs() -> Vec<HarnessCommandSpec> {
                 session_id_flag: None,
                 resume_flag: None,
             }),
+            event_protocol: None,
         },
         HarnessCommandSpec {
             id: "claude".to_string(),
@@ -627,6 +659,7 @@ pub fn built_in_harness_specs() -> Vec<HarnessCommandSpec> {
                 session_id_flag: Some("--session-id".to_string()),
                 resume_flag: Some("--resume".to_string()),
             }),
+            event_protocol: None,
         },
         HarnessCommandSpec {
             id: crate::engine::ENGINE_HARNESS_ID.to_string(),
@@ -676,6 +709,7 @@ pub fn built_in_harness_specs() -> Vec<HarnessCommandSpec> {
                 session_id_flag: Some("--session-id".to_string()),
                 resume_flag: Some("--resume".to_string()),
             }),
+            event_protocol: None,
         },
         HarnessCommandSpec {
             id: "copilot".to_string(),
@@ -746,6 +780,7 @@ pub fn built_in_harness_specs() -> Vec<HarnessCommandSpec> {
                 session_id_flag: Some("--session-id".to_string()),
                 resume_flag: Some("--session-id".to_string()),
             }),
+            event_protocol: None,
         },
     ]
 }
@@ -769,9 +804,19 @@ pub fn unsupported_harness_message(harness_id: &str, configured_ids: &[&str]) ->
     } else {
         configured_ids.join(", ")
     };
+    let recipe_hint = if known_adapter_manifest(harness_id).is_some() {
+        format!(
+            "To use it, run `coven adapter install {harness_id}`, then `coven adapter doctor {harness_id}`."
+        )
+    } else {
+        format!(
+            "Known installable adapter recipes: {}.",
+            known_adapter_recipe_names().join(", ")
+        )
+    };
     format!(
         "unsupported harness `{harness_id}`. Configured harnesses: {configured}. \
-To use Hermes, run `coven adapter install hermes`, then `coven adapter doctor hermes`. \
+{recipe_hint} \
 For other external harnesses, create a trusted adapter manifest under COVEN_HOME/{TRUSTED_ADAPTERS_DIR_NAME} \
 or set {EXTERNAL_ADAPTER_MANIFEST_ENV} / {EXTERNAL_ADAPTER_DIRS_ENV} before starting Coven."
     )
@@ -912,10 +957,51 @@ fn adapter_manifest_paths_in_dir(dir: &Path) -> Vec<PathBuf> {
 
 pub fn known_adapter_manifest(adapter_id: &str) -> Option<&'static str> {
     match adapter_id {
+        "grok" => Some(GROK_BUILD_ADAPTER_MANIFEST),
         "hermes" => Some(HERMES_ADAPTER_MANIFEST),
         _ => None,
     }
 }
+
+// Grok Build's headless emitter is public at
+// https://github.com/xai-org/grok-build/blob/main/crates/codegen/xai-grok-pager/src/headless.rs
+// and its CLI contract is documented at
+// https://docs.x.ai/build/cli/headless-scripting. Keep this as an opt-in
+// trusted recipe until maintainers promote it into the bundled harness set.
+const GROK_BUILD_ADAPTER_MANIFEST: &str = r#"{
+  "adapters": [
+    {
+      "id": "grok",
+      "label": "Grok Build",
+      "executable": "grok",
+      "interactive_prompt_prefix_args": ["--no-auto-update", "--no-alt-screen", "--output-format", "streaming-json"],
+      "non_interactive_prompt_prefix_args": ["--no-auto-update", "--no-alt-screen", "--output-format", "streaming-json"],
+      "install_hint": "Install Grok Build with `curl -fsSL https://x.ai/cli/install.sh | bash` or `npm install -g @xai-official/grok`; make sure `grok` is on PATH and run `grok login` (or set XAI_API_KEY for headless auth), then retry `coven adapter doctor grok`.",
+      "system_prompt_flag": "--rules",
+      "prompt_flag": "--single",
+      "interactive_prompt_flag": "--single",
+      "model_flag": "--model",
+      "capabilities": {
+        "stream": false,
+        "preassigned_session_id": true,
+        "think": false,
+        "speed": false
+      },
+      "event_protocol": "grok-headless-v1",
+      "sandbox": {
+        "full_args": ["--permission-mode", "bypassPermissions", "--sandbox", "off"],
+        "read_only_args": ["--permission-mode", "default", "--sandbox", "read-only"]
+      },
+      "continuity_args": {
+        "init_prefix_args": ["--no-auto-update", "--no-alt-screen", "--output-format", "streaming-json"],
+        "resume_prefix_args": ["--no-auto-update", "--no-alt-screen", "--output-format", "streaming-json"],
+        "session_id_flag": "--session-id",
+        "resume_flag": "--resume"
+      }
+    }
+  ]
+}
+"#;
 
 const HERMES_ADAPTER_MANIFEST: &str = r#"{
   "adapters": [
@@ -933,7 +1019,7 @@ const HERMES_ADAPTER_MANIFEST: &str = r#"{
 "#;
 
 pub fn known_adapter_recipe_names() -> &'static [&'static str] {
-    &["hermes"]
+    &["grok", "hermes"]
 }
 
 fn load_external_harness_specs(
@@ -1015,6 +1101,9 @@ struct ExternalHarnessAdapterSpec {
     /// One-shot non-interactive continuity args.
     #[serde(default, alias = "continuityArgs")]
     continuity_args: Option<ContinuityArgs>,
+    /// One-shot machine-readable stdout protocol translated by Coven.
+    #[serde(default, alias = "eventProtocol")]
+    event_protocol: Option<HarnessEventProtocol>,
 }
 
 impl ExternalHarnessAdapterSpec {
@@ -1083,6 +1172,14 @@ impl ExternalHarnessAdapterSpec {
                 )
             }
             _ => {}
+        }
+        if self.event_protocol.is_some() && self.capabilities.stream {
+            anyhow::bail!(
+                "external harness adapter `{id}` in {} cannot declare both an \
+                 `event_protocol` (one-shot stdout) and `capabilities.stream` \
+                 (long-lived stdin/stdout)",
+                manifest_path.display()
+            );
         }
         if let Some(args) = &self.continuity_args {
             if !args.has_init_launch() && !args.has_resume_launch() {
@@ -1187,6 +1284,7 @@ impl ExternalHarnessAdapterSpec {
             capabilities: self.capabilities,
             stream_args: self.stream_args,
             continuity_args: self.continuity_args,
+            event_protocol: self.event_protocol,
         })
     }
 }
@@ -2124,6 +2222,7 @@ mod tests {
             capabilities: Capabilities::BASELINE,
             stream_args: None,
             continuity_args: None,
+            event_protocol: None,
         };
 
         assert_eq!(
@@ -2169,6 +2268,164 @@ mod tests {
         assert!(message.contains(EXTERNAL_ADAPTER_MANIFEST_ENV));
         assert!(message.contains(EXTERNAL_ADAPTER_DIRS_ENV));
         assert!(message.contains("coven adapter doctor hermes"));
+    }
+
+    #[test]
+    fn unsupported_grok_message_points_to_trusted_recipe() {
+        let message = unsupported_harness_message("grok", &["codex", "claude"]);
+
+        assert!(message.contains("coven adapter install grok"));
+        assert!(message.contains("coven adapter doctor grok"));
+    }
+
+    #[test]
+    fn grok_build_recipe_matches_headless_cli_contract() -> anyhow::Result<()> {
+        let specs = parse_external_harness_specs(
+            GROK_BUILD_ADAPTER_MANIFEST,
+            Path::new("grok.json"),
+            &built_in_harness_specs(),
+        )?;
+        let grok = specs
+            .iter()
+            .find(|spec| spec.id == "grok")
+            .expect("Grok Build recipe should parse");
+
+        assert_eq!(grok.label, "Grok Build");
+        assert_eq!(grok.executable, "grok");
+        assert_eq!(grok.prompt_flag.as_deref(), Some("--single"));
+        assert_eq!(grok.interactive_prompt_flag.as_deref(), Some("--single"));
+        assert_eq!(grok.system_prompt_flag.as_deref(), Some("--rules"));
+        assert_eq!(
+            grok.event_protocol,
+            Some(HarnessEventProtocol::GrokHeadlessV1)
+        );
+        assert_eq!(grok.model_args("xai/grok-build"), ["--model", "grok-build"]);
+        assert_eq!(
+            grok.prompt_args("fix tests", HarnessLaunchMode::NonInteractive),
+            [
+                "--no-auto-update",
+                "--no-alt-screen",
+                "--output-format",
+                "streaming-json",
+                "--single=fix tests",
+            ]
+        );
+        assert_eq!(
+            grok.prompt_args("--version", HarnessLaunchMode::Interactive)
+                .last()
+                .map(String::as_str),
+            Some("--single=--version")
+        );
+        assert_eq!(
+            grok.sandbox_args(Permission::Full),
+            ["--permission-mode", "bypassPermissions", "--sandbox", "off",]
+        );
+        assert_eq!(
+            grok.sandbox_args(Permission::ReadOnly),
+            ["--permission-mode", "default", "--sandbox", "read-only"]
+        );
+        assert!(grok.capabilities.preassigned_session_id);
+        assert!(!grok.capabilities.stream);
+
+        let session_id = "11111111-2222-4333-8444-555555555555";
+        assert_eq!(
+            continuity_args(
+                grok,
+                HarnessLaunchMode::NonInteractive,
+                &ConversationHint::Init {
+                    id: session_id.to_string(),
+                },
+            ),
+            Some(vec![
+                "--no-auto-update".to_string(),
+                "--no-alt-screen".to_string(),
+                "--output-format".to_string(),
+                "streaming-json".to_string(),
+                "--session-id".to_string(),
+                session_id.to_string(),
+            ])
+        );
+        assert_eq!(
+            continuity_args(
+                grok,
+                HarnessLaunchMode::NonInteractive,
+                &ConversationHint::Resume {
+                    id: session_id.to_string(),
+                },
+            ),
+            Some(vec![
+                "--no-auto-update".to_string(),
+                "--no-alt-screen".to_string(),
+                "--output-format".to_string(),
+                "streaming-json".to_string(),
+                "--resume".to_string(),
+                session_id.to_string(),
+            ])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn installed_grok_recipe_constructs_complete_launch_argv() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let coven_home = temp_dir.path().join("coven-home");
+        let adapter_dir = trusted_adapter_dir(&coven_home);
+        fs::create_dir_all(&adapter_dir)?;
+        fs::write(
+            trusted_adapter_manifest_path(&coven_home, "grok"),
+            GROK_BUILD_ADAPTER_MANIFEST,
+        )?;
+
+        let _guard = env_lock().lock().unwrap();
+        let _manifest_guard = EnvVarGuard::remove(EXTERNAL_ADAPTER_MANIFEST_ENV);
+        let _dirs_guard = EnvVarGuard::remove(EXTERNAL_ADAPTER_DIRS_ENV);
+        let _coven_home_guard = EnvVarGuard::set("COVEN_HOME", &coven_home);
+        let familiar = FamiliarContext {
+            id: "charm".to_string(),
+            display_name: "Charm".to_string(),
+            role: None,
+        };
+        let conversation = ConversationHint::Init {
+            id: "11111111-2222-4333-8444-555555555555".to_string(),
+        };
+
+        let parts = command_parts_for_harness_with_conversation(
+            "grok",
+            "fix tests",
+            HarnessLaunchMode::NonInteractive,
+            Some(&conversation),
+            Some(&familiar),
+            HarnessLaunchOptions {
+                model: Some("xai/grok-build"),
+                permission: Some(Permission::ReadOnly),
+                ..Default::default()
+            },
+        )?;
+
+        assert_eq!(
+            parts,
+            (
+                "grok".to_string(),
+                vec![
+                    "--model".to_string(),
+                    "grok-build".to_string(),
+                    "--permission-mode".to_string(),
+                    "default".to_string(),
+                    "--sandbox".to_string(),
+                    "read-only".to_string(),
+                    "--rules".to_string(),
+                    familiar.identity_preamble(),
+                    "--no-auto-update".to_string(),
+                    "--no-alt-screen".to_string(),
+                    "--output-format".to_string(),
+                    "streaming-json".to_string(),
+                    "--session-id".to_string(),
+                    conversation.id().to_string(),
+                    "--single=fix tests".to_string(),
+                ],
+            )
+        );
+        Ok(())
     }
 
     #[test]
@@ -2474,6 +2731,18 @@ mod tests {
                     "capabilities":{"stream":true,"preassigned_session_id":true},
                     "stream_args":{"prefix_args":["-p"]}}]}"#,
                 "no session id flag",
+            ),
+            (
+                // A finite event bridge and a long-lived stream are distinct
+                // process contracts and cannot both own stdout.
+                r#"{"adapters":[{"id":"x","label":"X","executable":"x",
+                    "interactive_prompt_prefix_args":[],
+                    "non_interactive_prompt_prefix_args":["run"],
+                    "install_hint":"hint",
+                    "event_protocol":"grok-headless-v1",
+                    "capabilities":{"stream":true},
+                    "stream_args":{"prefix_args":["-p"]}}]}"#,
+                "cannot declare both an `event_protocol`",
             ),
         ];
         for (raw, expected) in cases {
@@ -3640,6 +3909,7 @@ mod tests {
             capabilities: Capabilities::BASELINE,
             stream_args: None,
             continuity_args: None,
+            event_protocol: None,
         };
         assert!(!spec.supports_permission());
         assert!(spec.sandbox_args(Permission::Full).is_empty());
@@ -3667,6 +3937,7 @@ mod tests {
             capabilities: Capabilities::BASELINE,
             stream_args: None,
             continuity_args: None,
+            event_protocol: None,
         };
         assert!(!spec.supports_add_dir());
         assert!(spec.add_dir_args(&["/tmp/other".to_string()]).is_empty());

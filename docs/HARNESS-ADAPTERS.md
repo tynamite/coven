@@ -29,8 +29,7 @@ A Coven harness adapter defines:
 - prompt argument shape for non-interactive mode;
 - install/authentication hint for `coven doctor`; and
 - optional **declared behavior**: `capabilities`, `sandbox`, `stream_args`,
-  and `continuity_args` (the [coven-runtimes](https://github.com/OpenCoven/coven-runtimes)
-  manifest additions — see below).
+  `continuity_args`, and a finite `event_protocol` (see below).
 
 The current implementation expects the prompt to be the final command argument after any fixed prefix args — either as a positional behind `--`, or bound to a declared `prompt_flag` (`--flag=<prompt>`) for harnesses with no positional prompt slot. Keep that invariant unless the adapter explicitly documents a safer stdin or protocol mode.
 
@@ -121,6 +120,12 @@ adapters deserialize unchanged with everything off):
   `capabilities.preassigned_session_id` is true; resume-only adapters can omit
   it and use `resume_prefix_args` to place the resumed session id as a
   positional argument.
+- `event_protocol` (alias `eventProtocol`) selects a reviewed machine-readable
+  stdout translator for a **finite** headless process. The first supported
+  value is `grok-headless-v1`, matching Grok Build's public
+  `--output-format streaming-json` emitter. An event protocol and
+  `capabilities.stream` are mutually exclusive: the former exits after one
+  prompt, while the latter is a long-lived bidirectional process.
 - `sandbox` maps `coven run --permission <full|read-only>` to the harness's
   native flags. Two forms: a single `--flag value` pair per policy (shown
   above), or an argv list per policy for boolean/multi-token permission flags:
@@ -148,6 +153,18 @@ Accepted, conformance-tested manifests for real runtimes live in the
 [coven-runtimes canonical registry](https://github.com/OpenCoven/coven-runtimes).
 
 This manifest path is for explicit integration work. It is not a public support claim for every adapter listed in a maintainer's local manifest.
+
+### Trusted installable recipes
+
+Coven can ship reviewed external manifests without promoting them into the bundled compatibility set. Users install these versioned recipes explicitly; Coven then loads them from its trusted adapter directory only while their contents exactly match the bundled recipe.
+
+```sh
+coven adapter install grok
+coven adapter doctor grok
+coven run grok "what is in this project?"
+```
+
+The Grok Build recipe uses the documented `grok --single` headless interface, model and session flags, native permission/sandbox controls, and the source-defined `streaming-json` event schema. Coven translates native text/end/error frames, suppresses thought frames, and verifies the returned session id. See [Grok Build (experimental)](/harnesses/grok-build) for the exact contract and remaining promotion checks.
 
 ## Model selection (`coven run --model`)
 
@@ -246,7 +263,8 @@ Before adding a new harness, confirm:
 - the CLI can be detected safely on `PATH`;
 - the prompt can be passed without shell interpolation;
 - the process can run from a validated project cwd;
-- output can be captured through PTY/session events;
+- output can be captured through a PTY or a reviewed machine-readable pipe
+  protocol and replayed as Coven session events;
 - authentication stays in the harness provider's normal local flow;
 - failure modes are understandable in `coven doctor`;
 - tests cover command construction and missing executable behavior.
@@ -300,7 +318,7 @@ For a candidate harness, document:
 
 ## Session identity mapping
 
-Some harnesses have their own upstream session ids. Coven's session id remains the local runtime id.
+Some harnesses have their own upstream session ids. Coven's session id remains the local runtime id. A harness that safely accepts a caller-assigned UUID may use the same value upstream, but Coven still verifies the native terminal metadata before trusting that mapping.
 
 If upstream ids become useful, store them as metadata rather than replacing Coven's own id. Clients should be able to rely on a stable Coven id for attach, events, archive, summon, and sacrifice.
 
