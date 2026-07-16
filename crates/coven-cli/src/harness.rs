@@ -214,6 +214,21 @@ impl ConversationHint {
     }
 }
 
+/// Build the cold-start conversation hint required by a finite event-protocol
+/// adapter. Other harnesses may support caller-assigned ids for explicit
+/// stream or continuity launches, but that capability alone must not change
+/// their existing fresh one-shot argv.
+pub fn event_protocol_init_hint(
+    spec: &HarnessCommandSpec,
+    session_id: &str,
+) -> Option<ConversationHint> {
+    (spec.event_protocol.is_some() && spec.capabilities.preassigned_session_id).then(|| {
+        ConversationHint::Init {
+            id: session_id.to_string(),
+        }
+    })
+}
+
 /// Whether the harness CLI lets the caller pre-assign a session id at launch
 /// time (e.g. `claude --session-id <uuid>`). Harnesses that auto-generate
 /// session ids (e.g. codex) return `false`; the chat app captures the id from
@@ -2280,10 +2295,11 @@ mod tests {
 
     #[test]
     fn grok_build_recipe_matches_headless_cli_contract() -> anyhow::Result<()> {
+        let built_ins = built_in_harness_specs();
         let specs = parse_external_harness_specs(
             GROK_BUILD_ADAPTER_MANIFEST,
             Path::new("grok.json"),
-            &built_in_harness_specs(),
+            &built_ins,
         )?;
         let grok = specs
             .iter()
@@ -2328,6 +2344,23 @@ mod tests {
         assert!(!grok.capabilities.stream);
 
         let session_id = "11111111-2222-4333-8444-555555555555";
+        assert_eq!(
+            event_protocol_init_hint(grok, session_id),
+            Some(ConversationHint::Init {
+                id: session_id.to_string(),
+            })
+        );
+        for harness_id in ["claude", crate::engine::ENGINE_HARNESS_ID, "copilot"] {
+            let existing = built_ins
+                .iter()
+                .find(|spec| spec.id == harness_id)
+                .expect("preassigned-id built-in should exist");
+            assert_eq!(
+                event_protocol_init_hint(existing, session_id),
+                None,
+                "fresh one-shot {harness_id} argv must remain unchanged"
+            );
+        }
         assert_eq!(
             continuity_args(
                 grok,

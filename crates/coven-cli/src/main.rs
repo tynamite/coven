@@ -3232,15 +3232,9 @@ fn run_session(
             record.id.clone()
         };
         Some(harness::ConversationHint::Resume { id: resume_id })
-    } else if spec
-        .as_ref()
-        .is_some_and(|spec| spec.capabilities.preassigned_session_id)
-    {
-        Some(harness::ConversationHint::Init {
-            id: record.id.clone(),
-        })
     } else {
-        None
+        spec.as_ref()
+            .and_then(|spec| harness::event_protocol_init_hint(spec, &record.id))
     };
     // Only pass familiar_ctx to the arg builder for harnesses that have a
     // system_prompt_flag (e.g. Claude). For harnesses without one (e.g. Codex)

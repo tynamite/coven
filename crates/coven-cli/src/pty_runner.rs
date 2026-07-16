@@ -271,10 +271,10 @@ fn write_stdin_prompt(child: &mut std::process::Child, prompt: Option<&[u8]>) ->
     result
 }
 
-const CODEX_JSON_ACTIVITY_TIMEOUT: Duration = Duration::from_secs(5 * 60);
-const CODEX_POST_EXIT_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
-const CODEX_CHILD_POLL_INTERVAL: Duration = Duration::from_millis(50);
-const CODEX_STDERR_TAIL_BYTES: usize = 8 * 1024;
+const JSONL_ACTIVITY_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const PIPED_POST_EXIT_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
+const PIPED_CHILD_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const PIPED_STDERR_TAIL_BYTES: usize = 8 * 1024;
 const GROK_HEADLESS_AUTH_ERROR: &str = "Grok Build requested interactive device authentication during a headless run; authenticate first with `grok login` or `grok login --device-auth`, or set XAI_API_KEY";
 
 // `codex exec --json` runs in a separate Unix session so a timeout can clean
@@ -434,7 +434,7 @@ fn codex_json_activity_timeout() -> Duration {
     {
         return Duration::from_millis(timeout_ms);
     }
-    CODEX_JSON_ACTIVITY_TIMEOUT
+    JSONL_ACTIVITY_TIMEOUT
 }
 
 enum CodexStdoutMessage {
@@ -620,7 +620,7 @@ where
     stream_codex_json_with_timeouts(
         command,
         codex_json_activity_timeout(),
-        CODEX_POST_EXIT_DRAIN_TIMEOUT,
+        PIPED_POST_EXIT_DRAIN_TIMEOUT,
         on_assistant,
     )
 }
@@ -637,7 +637,7 @@ where
     stream_codex_json_with_timeouts(
         command,
         activity_timeout,
-        CODEX_POST_EXIT_DRAIN_TIMEOUT,
+        PIPED_POST_EXIT_DRAIN_TIMEOUT,
         on_assistant,
     )
 }
@@ -759,7 +759,7 @@ where
             match reader.read(&mut buffer) {
                 Ok(0) => break,
                 Ok(count) => {
-                    append_bounded_tail(&mut tail, &buffer[..count], CODEX_STDERR_TAIL_BYTES)
+                    append_bounded_tail(&mut tail, &buffer[..count], PIPED_STDERR_TAIL_BYTES)
                 }
                 Err(_) => break,
             }
@@ -834,7 +834,7 @@ where
             remaining
         };
 
-        match receiver.recv_timeout(remaining.min(CODEX_CHILD_POLL_INTERVAL)) {
+        match receiver.recv_timeout(remaining.min(PIPED_CHILD_POLL_INTERVAL)) {
             Ok(CodexRunnerMessage::Stdout(CodexStdoutMessage::Line(line))) => {
                 match handle_codex_json_line(&line, &mut state, &mut on_assistant) {
                     Ok(true) => last_activity = Instant::now(),
@@ -888,7 +888,7 @@ where
                 // so sleep explicitly to keep the child/deadline polling at
                 // its normal cadence instead of busy-spinning until the
                 // activity timeout fires.
-                thread::sleep(remaining.min(CODEX_CHILD_POLL_INTERVAL));
+                thread::sleep(remaining.min(PIPED_CHILD_POLL_INTERVAL));
             }
         }
     }
@@ -1052,6 +1052,25 @@ pub fn stream_harness_event_protocol<F>(
     command: &HarnessCommand,
     protocol: crate::harness::HarnessEventProtocol,
     expected_session_id: Option<&str>,
+    on_assistant: F,
+) -> Result<HarnessEventRunResult>
+where
+    F: FnMut(&str) -> Result<()>,
+{
+    stream_harness_event_protocol_with_timeout(
+        command,
+        protocol,
+        expected_session_id,
+        JSONL_ACTIVITY_TIMEOUT,
+        on_assistant,
+    )
+}
+
+fn stream_harness_event_protocol_with_timeout<F>(
+    command: &HarnessCommand,
+    protocol: crate::harness::HarnessEventProtocol,
+    expected_session_id: Option<&str>,
+    activity_timeout: Duration,
     mut on_assistant: F,
 ) -> Result<HarnessEventRunResult>
 where
@@ -1121,7 +1140,7 @@ where
                         let _ = sink.flush();
                     }
                     if let Ok(mut tail) = stderr_tail_writer.lock() {
-                        append_bounded_tail(&mut tail, &buffer, CODEX_STDERR_TAIL_BYTES);
+                        append_bounded_tail(&mut tail, &buffer, PIPED_STDERR_TAIL_BYTES);
                     }
                 }
                 Err(_) => break,
@@ -1136,17 +1155,18 @@ where
         &mut child,
         &mut process_tree,
         protocol,
+        activity_timeout,
         &mut state,
         &mut on_assistant,
     ) {
         Ok(result) => result,
         Err(error) => {
             let _ = child.wait();
-            let _ = stderr_done_rx.recv_timeout(CODEX_POST_EXIT_DRAIN_TIMEOUT);
+            let _ = stderr_done_rx.recv_timeout(PIPED_POST_EXIT_DRAIN_TIMEOUT);
             return Err(error);
         }
     };
-    let _ = stderr_done_rx.recv_timeout(CODEX_POST_EXIT_DRAIN_TIMEOUT);
+    let _ = stderr_done_rx.recv_timeout(PIPED_POST_EXIT_DRAIN_TIMEOUT);
     let stderr_tail = stderr_tail
         .lock()
         .map(|tail| tail.clone())
@@ -1309,9 +1329,9 @@ fn finalize_harness_event_state(
         (expected_session_id, state.harness_session_id.as_deref())
     {
         if expected != actual {
-            state.protocol_error = Some(format!(
-                "harness returned session id `{actual}` after Coven assigned `{expected}`"
-            ));
+            state.protocol_error.get_or_insert_with(|| {
+                format!("harness returned session id `{actual}` after Coven assigned `{expected}`")
+            });
         }
     }
 }
@@ -1352,6 +1372,7 @@ fn drain_harness_event_stdout<F>(
     child: &mut std::process::Child,
     process_tree: &mut PipedProcessTree,
     protocol: crate::harness::HarnessEventProtocol,
+    activity_timeout: Duration,
     state: &mut HarnessEventState,
     on_assistant: &mut F,
 ) -> Result<(std::process::ExitStatus, bool)>
@@ -1374,6 +1395,7 @@ where
 
     let mut status = None;
     let mut post_exit_deadline = None;
+    let mut last_activity = Instant::now();
     let mut stdout_closed = false;
     let mut pipe_timeout = false;
     loop {
@@ -1386,7 +1408,7 @@ where
                 }
             };
             if status.is_some() {
-                post_exit_deadline = Some(Instant::now() + CODEX_POST_EXIT_DRAIN_TIMEOUT);
+                post_exit_deadline = Some(Instant::now() + PIPED_POST_EXIT_DRAIN_TIMEOUT);
             }
         }
         if status.is_some() && stdout_closed {
@@ -1402,9 +1424,25 @@ where
                 process_tree.terminate(child);
                 break;
             }
-            remaining.min(CODEX_CHILD_POLL_INTERVAL)
+            remaining.min(PIPED_CHILD_POLL_INTERVAL)
         } else {
-            CODEX_CHILD_POLL_INTERVAL
+            let remaining = activity_timeout
+                .checked_sub(last_activity.elapsed())
+                .unwrap_or_default();
+            if remaining.is_zero() {
+                state.protocol_error.get_or_insert_with(|| {
+                    "harness produced no machine-readable activity before the timeout; the process tree was terminated"
+                        .to_string()
+                });
+                process_tree.terminate(child);
+                status = Some(
+                    child
+                        .wait()
+                        .context("failed waiting for timed-out event-protocol harness")?,
+                );
+                break;
+            }
+            remaining.min(PIPED_CHILD_POLL_INTERVAL)
         };
 
         if stdout_closed {
@@ -1421,6 +1459,7 @@ where
                     process_tree.terminate(child);
                     return Err(error);
                 }
+                last_activity = Instant::now();
             }
             Ok(HarnessEventStdoutMessage::ReadError(error)) => {
                 process_tree.terminate(child);
@@ -1861,11 +1900,31 @@ pub fn spawn_harness_event_protocol_with_observer(
     protocol: crate::harness::HarnessEventProtocol,
     expected_session_id: Option<&str>,
 ) -> Result<PipedSession> {
+    spawn_harness_event_protocol_with_observer_and_timeout(
+        command,
+        observer,
+        protocol,
+        expected_session_id,
+        JSONL_ACTIVITY_TIMEOUT,
+    )
+}
+
+fn spawn_harness_event_protocol_with_observer_and_timeout(
+    command: &HarnessCommand,
+    observer: Option<DetachedPtyObserver>,
+    protocol: crate::harness::HarnessEventProtocol,
+    expected_session_id: Option<&str>,
+    activity_timeout: Duration,
+) -> Result<PipedSession> {
     spawn_piped_with_observer_inner(
         command,
         observer,
         false,
-        Some((protocol, expected_session_id.map(str::to_string))),
+        Some((
+            protocol,
+            expected_session_id.map(str::to_string),
+            activity_timeout,
+        )),
     )
 }
 
@@ -1873,7 +1932,11 @@ fn spawn_piped_with_observer_inner(
     command: &HarnessCommand,
     observer: Option<DetachedPtyObserver>,
     wrap_stderr_as_stream_json: bool,
-    event_bridge: Option<(crate::harness::HarnessEventProtocol, Option<String>)>,
+    event_bridge: Option<(
+        crate::harness::HarnessEventProtocol,
+        Option<String>,
+        Duration,
+    )>,
 ) -> Result<PipedSession> {
     use std::process::Command as StdCommand;
     use std::sync::{Arc, Mutex as StdMutex};
@@ -1953,7 +2016,7 @@ fn spawn_piped_with_observer_inner(
         on_exit: Box::new(|_| {}),
     });
     let on_output_shared = Arc::new(StdMutex::new(on_output));
-    let stderr_event_protocol = event_bridge.as_ref().map(|(protocol, _)| *protocol);
+    let stderr_event_protocol = event_bridge.as_ref().map(|(protocol, _, _)| *protocol);
     let auth_wait_detected = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let stderr_tail = Arc::new(StdMutex::new(Vec::new()));
 
@@ -1995,7 +2058,7 @@ fn spawn_piped_with_observer_inner(
                     }
                     if stderr_event_protocol.is_some() {
                         if let Ok(mut tail) = stderr_tail_writer.lock() {
-                            append_bounded_tail(&mut tail, &buf, CODEX_STDERR_TAIL_BYTES);
+                            append_bounded_tail(&mut tail, &buf, PIPED_STDERR_TAIL_BYTES);
                         }
                     }
                     let mut payload = if wrap_stderr_as_stream_json {
@@ -2026,7 +2089,7 @@ fn spawn_piped_with_observer_inner(
     let stdout_auth_wait = Arc::clone(&auth_wait_detected);
     let stdout_stderr_tail = Arc::clone(&stderr_tail);
     thread::spawn(move || {
-        let result = if let Some((protocol, expected_session_id)) = event_bridge {
+        let result = if let Some((protocol, expected_session_id, activity_timeout)) = event_bridge {
             let mut process_tree = event_process_tree
                 .expect("event-protocol launch should own an isolated process tree");
             let mut state = HarnessEventState::default();
@@ -2041,6 +2104,7 @@ fn spawn_piped_with_observer_inner(
                 &mut child,
                 &mut process_tree,
                 protocol,
+                activity_timeout,
                 &mut state,
                 &mut on_assistant,
             ) {
@@ -2053,7 +2117,7 @@ fn spawn_piped_with_observer_inner(
                     (child.wait(), false)
                 }
             };
-            let _ = stderr_done_rx.recv_timeout(CODEX_POST_EXIT_DRAIN_TIMEOUT);
+            let _ = stderr_done_rx.recv_timeout(PIPED_POST_EXIT_DRAIN_TIMEOUT);
             if stdout_auth_wait.load(std::sync::atomic::Ordering::Relaxed) {
                 state.protocol_error = Some(GROK_HEADLESS_AUTH_ERROR.to_string());
             }
@@ -2509,6 +2573,108 @@ printf '%s\n' '{"type":"end","stopReason":"EndTurn","sessionId":"session-1","req
 
     #[cfg(unix)]
     #[test]
+    fn grok_headless_runner_times_out_after_mid_turn_inactivity() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _guard = fake_claude_spawn_guard();
+        let temp_dir = tempfile::tempdir()?;
+        let fake_grok = temp_dir.path().join("fake-grok-stall");
+        std::fs::write(
+            &fake_grok,
+            r#"#!/bin/sh
+printf '%s\n' '{"type":"text","data":"partial reply"}'
+exec /bin/sleep 30
+"#,
+        )?;
+        let mut permissions = std::fs::metadata(&fake_grok)?.permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&fake_grok, permissions)?;
+        let command = HarnessCommand {
+            program: fake_grok.to_string_lossy().into_owned(),
+            args: Vec::new(),
+            cwd: temp_dir.path().to_path_buf(),
+            stdin_prompt: None,
+        };
+        let mut output = String::new();
+        let started = Instant::now();
+
+        let outcome = stream_harness_event_protocol_with_timeout(
+            &command,
+            crate::harness::HarnessEventProtocol::GrokHeadlessV1,
+            Some("session-1"),
+            Duration::from_secs(1),
+            |text| {
+                output.push_str(text);
+                Ok(())
+            },
+        )?;
+
+        assert!(started.elapsed() < Duration::from_secs(3));
+        assert_eq!(output, "partial reply");
+        assert_eq!(outcome.process.status, "failed");
+        assert_eq!(outcome.process.exit_code, Some(1));
+        assert!(outcome
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("no machine-readable activity")));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn grok_headless_daemon_bridge_times_out_after_mid_turn_inactivity() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _guard = fake_claude_spawn_guard();
+        let temp_dir = tempfile::tempdir()?;
+        let fake_grok = temp_dir.path().join("fake-grok-stall");
+        std::fs::write(
+            &fake_grok,
+            r#"#!/bin/sh
+printf '%s\n' '{"type":"text","data":"partial reply"}'
+exec /bin/sleep 30
+"#,
+        )?;
+        let mut permissions = std::fs::metadata(&fake_grok)?.permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&fake_grok, permissions)?;
+        let command = HarnessCommand {
+            program: fake_grok.to_string_lossy().into_owned(),
+            args: Vec::new(),
+            cwd: temp_dir.path().to_path_buf(),
+            stdin_prompt: None,
+        };
+        let (output_tx, output_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        let (exit_tx, exit_rx) = std::sync::mpsc::channel::<PtyRunResult>();
+        let started = Instant::now();
+
+        let _session = spawn_harness_event_protocol_with_observer_and_timeout(
+            &command,
+            Some(DetachedPtyObserver {
+                on_output: Box::new(move |chunk| {
+                    let _ = output_tx.send(chunk);
+                }),
+                on_exit: Box::new(move |result| {
+                    let _ = exit_tx.send(result);
+                }),
+            }),
+            crate::harness::HarnessEventProtocol::GrokHeadlessV1,
+            Some("session-1"),
+            Duration::from_secs(1),
+        )?;
+
+        let outcome = exit_rx.recv_timeout(Duration::from_secs(3))?;
+        let output = String::from_utf8(output_rx.try_iter().flatten().collect())?;
+        assert!(started.elapsed() < Duration::from_secs(3));
+        assert_eq!(outcome.status, "failed");
+        assert_eq!(outcome.exit_code, Some(1));
+        assert!(output.contains("partial reply"));
+        assert!(output.contains("no machine-readable activity"));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn grok_headless_runner_fails_fast_on_interactive_auth_prompt() -> anyhow::Result<()> {
         use std::os::unix::fs::PermissionsExt;
 
@@ -2815,6 +2981,31 @@ exit 0
         assert_eq!(
             state.protocol_error.as_deref(),
             Some("harness returned session id `other` after Coven assigned `assigned`")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn grok_headless_session_mismatch_preserves_an_earlier_native_error() -> anyhow::Result<()> {
+        let protocol = crate::harness::HarnessEventProtocol::GrokHeadlessV1;
+        let mut state = HarnessEventState::default();
+        handle_harness_event_line(
+            protocol,
+            r#"{"type":"error","message":"native provider failure"}"#,
+            &mut state,
+            &mut |_| Ok(()),
+        )?;
+        handle_harness_event_line(
+            protocol,
+            r#"{"type":"end","stopReason":"Error","sessionId":"other","requestId":"request-1"}"#,
+            &mut state,
+            &mut |_| Ok(()),
+        )?;
+        finalize_harness_event_state(&mut state, protocol, Some("assigned"));
+
+        assert_eq!(
+            state.protocol_error.as_deref(),
+            Some("native provider failure")
         );
         Ok(())
     }

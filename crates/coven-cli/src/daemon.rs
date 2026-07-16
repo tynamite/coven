@@ -259,10 +259,7 @@ impl SessionRuntime for LiveSessionRuntime {
         let conversation = launch.conversation.clone().or_else(|| {
             adapter
                 .as_ref()
-                .filter(|spec| spec.capabilities.preassigned_session_id)
-                .map(|_| crate::harness::ConversationHint::Init {
-                    id: launch.id.clone(),
-                })
+                .and_then(|spec| crate::harness::event_protocol_init_hint(spec, &launch.id))
         });
         let launch_mode = if event_protocol.is_some() {
             // A declared event protocol is a finite headless process even when
