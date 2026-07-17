@@ -88,7 +88,15 @@ The terminal `requestId` and `stopReason` are validated by the bridge but are no
 | `full` | `--permission-mode bypassPermissions --sandbox off` |
 | `read-only` | `--permission-mode default --sandbox read-only` |
 
-Use `read-only` for review and audit work. Grok's public source accepts `plan` as a compatibility value on the command line but does not activate a plan permission policy from that value, so the adapter explicitly selects `default` and relies on the native read-only sandbox for the filesystem boundary. Grok's own documentation notes that child-process network blocking in restrictive sandbox profiles is currently enforced on Linux but not macOS; treat that platform limitation as part of Grok's boundary, not a guarantee supplied by Coven.
+When `--permission` is omitted, Coven's policy defaults to `full`. For Grok Build, Coven applies that default explicitly by launching `--permission-mode bypassPermissions --sandbox off`; it does not leave the decision to Grok's native defaults. This allows the headless turn to proceed without Grok permission prompts and disables Grok's process sandbox, so treat an omitted permission flag as an explicit full-trust choice.
+
+Daemon and chat launches currently use this full mapping on every turn. The daemon session API does not expose a permission field, so daemon and chat clients cannot request Grok's read-only mapping yet. For review and audit work that requires read-only behavior, use a direct foreground launch:
+
+```bash
+coven run grok "review this repository" --permission read-only
+```
+
+Grok's public source accepts `plan` as a compatibility value on the command line but does not activate a plan permission policy from that value, so the adapter explicitly selects `default` and relies on the native read-only sandbox for the filesystem boundary. Grok's own documentation notes that child-process network blocking in restrictive sandbox profiles is currently enforced on Linux but not macOS; treat that platform limitation as part of Grok's boundary, not a guarantee supplied by Coven.
 
 Grok Build does not document a native additional-directory flag, so `coven run grok --add-dir ...` is a warned no-op. Start the session at the intended project root instead.
 
