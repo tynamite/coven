@@ -6,14 +6,19 @@ Prepared from the reviewed adapter branch `agent/grok-build-adapter` @ `7e73273`
 
 ## What "the runtime PR" is
 
-Two upstream changes, in order:
+Two upstream changes, **independent of each other** (they can go in parallel):
 
 1. **OpenCoven/coven-runtimes** (this packet): extend the shared
    `coven-runtime-spec` with the `event_protocol` field and register the Grok
    Build manifest as an accepted, conformance-tested runtime. Tag as `v0.1.4`.
-2. **OpenCoven/coven** (follow-up, separate PR): re-target the adapter branch
-   from the fork, bump the `coven-runtime-spec` pin to `v0.1.4`, and move
-   `event_protocol` deserialization onto the spec type.
+2. **OpenCoven/coven** (separate PR): re-target the adapter branch from the
+   fork. The adapter PR stays adapter-scoped: coven's CLI-local
+   `HarnessEventProtocol`/`ContinuityArgs` parse the same manifest JSON as the
+   spec types (wire-compatible), so **no pin bump and no type replacement** —
+   coven only consumes `Capabilities`/`SandboxMapping` from the pinned spec,
+   which are unchanged in v0.1.4. Migrating coven's loader onto the spec's
+   types and shared `validate_manifest` rules is a later, separate unification
+   chore (the spec crate itself frames loader adoption as "eventually").
 
 Before opening either PR, follow the upstream claim protocol (`coven claim
 status` + open-PR check, then `coven claim acquire`) — "someone has to make
@@ -156,15 +161,19 @@ maturity.
 > - Current state: adapter implementation reviewed and hardened on the staging
 >   fork (tynamite/coven#1: inactivity timeout, signal supervision, scoped
 >   session-init hint, error precedence).
-> - Follow-ups: companion OpenCoven/coven PR bumping the pin to v0.1.4.
+> - Follow-ups: companion OpenCoven/coven adapter PR (independent — no pin
+>   bump needed); later unification chore migrates coven's loader onto the
+>   spec types and shared validation.
 > - Known gaps: see §4 of the packet.
 
 ## 6. Companion coven PR checklist
 
 1. Claim the upstream issue; check for existing PRs.
 2. Rebase `agent/grok-build-adapter` onto current `OpenCoven/coven` `main`.
-3. Bump `coven-runtime-spec` pin to `v0.1.4`; replace the CLI-local
-   `HarnessEventProtocol` with the spec type where they now overlap.
+3. No spec pin bump: the adapter's local `HarnessEventProtocol`/
+   `ContinuityArgs` are wire-compatible with the spec types, and coven only
+   consumes `Capabilities`/`SandboxMapping` (unchanged) from the pin. Leave
+   type/validation unification to a separate later chore PR.
 4. Add the permission-default documentation to `docs/harnesses/grok-build.md`
    (§4 above).
 5. Run the full local gate set; fill the readiness template from this packet.
