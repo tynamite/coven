@@ -17,11 +17,10 @@ The Coven harness id is `grok`; the executable is `grok`.
 
 <Steps>
   <Step title="Install and authenticate Grok Build">
-    Use either installation path documented by xAI:
+    Use either installation path documented by xAI (the npm package, or the
+    shell installer described in the [official install guide](https://docs.x.ai/build)):
 
     ```bash
-    curl -fsSL https://x.ai/cli/install.sh | bash
-    # or
     npm install -g @xai-official/grok
     ```
 
